@@ -31,6 +31,8 @@ Item {
   readonly property color foreground: Color.menu.text
   readonly property color dim: Qt.darker(foreground, 1.5)
   readonly property color urgent: Color.urgent
+  // The bar's active colour, so a toggle here reads the same as the bar icon.
+  readonly property color accentOn: Color.bar.active
   readonly property var borderSpec: Border.surfaceSpec(
     "menu", "border", Color.menu.border, Math.max(1, Style.space(2)))
 
@@ -433,9 +435,10 @@ Item {
                 }
               }
 
-              ToggleSwitch {
+              StateSwitch {
                 checked: root.ready && root.service.autoHideFullscreen
                 foreground: root.foreground
+                onColor: root.accentOn
                 enabled: root.ready && !root.service.busy
                 onToggled: root.service.setAutoHide(!root.service.autoHideFullscreen)
               }
@@ -472,9 +475,10 @@ Item {
                 }
               }
 
-              ToggleSwitch {
+              StateSwitch {
                 checked: root.ready && root.service.alertsRunning
                 foreground: root.foreground
+                onColor: root.accentOn
                 enabled: root.ready && !root.service.busy && root.service.configured
                 onToggled: root.service.toggleAlerts()
               }

@@ -18,10 +18,12 @@ function sizeLabel(size) {
 
 // The bar icon carries the whole state at a glance: pinned, ready, or broken.
 function barGlyph(state) {
-  if (!state.configured) return "󰜥"   // camera-off: nothing set up yet
-  if (state.pipRunning) return "󰜐"    // cctv: live view is on screen
-  if (!state.reachable) return "󰜥"
-  return "󰃅"                          // camera: ready, not pinned
+  // Shape says what is on screen, colour says whether it is live. The two cctv
+  // glyphs are a matched pair -- the same camera, one struck through -- so the
+  // "nothing to show" state reads as the same object rather than a new one.
+  if (!state.configured || !state.reachable) return "󱡟"   // cctv-off
+  if (state.pipRunning && state.mode === "grid") return "󰕰"   // 2x2 grid
+  return "󰞮"                                                  // cctv
 }
 
 function stateDot(camera) {

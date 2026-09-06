@@ -360,7 +360,7 @@ Panel {
               // The switch is the pin. It mirrors what left-clicking the bar
               // icon does, so the popup teaches the shortcut.
               trailingControl: Component {
-                ToggleSwitch {
+                StateSwitch {
                   id: pinSwitch
                   enabled: root.configured && root.ready
                     && (root.gridMode ? root.svc.gridReady : root.svc.activeCameraId !== "")
@@ -368,6 +368,7 @@ Panel {
                   busy: root.ready && root.svc.busy
                   hasCursor: header.ringVisible
                   foreground: hero.foreground
+                  onColor: root.urgent
                   onHovered: function(on) { if (on) header.focusHero() }
                   onToggled: root.primaryAction()
 
@@ -539,7 +540,7 @@ Panel {
             }
 
             PanelActionButton {
-              iconText: root.gridMode ? "󰕰" : "󰋁"
+              iconText: root.gridMode ? "󰕰" : "󰞮"
               tooltipText: root.gridMode ? "Grid mode — switch to one camera"
                                          : "Single camera — switch to grid"
               foreground: root.gridMode ? root.urgent : root.foreground
