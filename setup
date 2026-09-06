@@ -1,0 +1,86 @@
+#!/usr/bin/env bash
+# Install the Hyprland window rules this plugin needs.
+#
+# Omarchy's plugin installer deliberately never runs plugin code, so the rules
+# that place, float and pin the camera window can't be installed automatically.
+# Run this once after `omarchy plugin add`. It is idempotent.
+
+set -euo pipefail
+
+PLUGIN_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+HYPR_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/hypr"
+RULES_SRC="$PLUGIN_DIR/hypr/unifi_overlay.lua"
+RULES_DST="$HYPR_DIR/unifi_overlay.lua"
+HYPRLAND_LUA="$HYPR_DIR/hyprland.lua"
+REQUIRE_LINE='require("hypr.unifi_overlay")'
+
+info() { printf '  %s\n' "$*"; }
+warn() { printf '  !! %s\n' "$*" >&2; }
+
+echo "unifi-overlay setup"
+
+# --- dependencies -----------------------------------------------------------
+missing=()
+for cmd in mpv python3 secret-tool hyprctl; do
+  command -v "$cmd" >/dev/null 2>&1 || missing+=("$cmd")
+done
+if ((${#missing[@]})); then
+  warn "missing required commands: ${missing[*]}"
+  warn "install them, then run this again"
+  exit 1
+fi
+info "dependencies ok"
+
+# --- window rules -----------------------------------------------------------
+[[ -f "$RULES_SRC" ]] || { warn "missing $RULES_SRC"; exit 1; }
+mkdir -p "$HYPR_DIR"
+
+if [[ -f "$RULES_DST" ]] && ! cmp -s "$RULES_SRC" "$RULES_DST"; then
+  backup="$RULES_DST.bak.$(date +%s)"
+  cp "$RULES_DST" "$backup"
+  info "backed up your existing rules to $(basename "$backup")"
+fi
+cp "$RULES_SRC" "$RULES_DST"
+info "installed $RULES_DST"
+
+# --- wire it into hyprland.lua ---------------------------------------------
+if [[ ! -f "$HYPRLAND_LUA" ]]; then
+  warn "no $HYPRLAND_LUA found; add this line to your Hyprland config yourself:"
+  warn "  $REQUIRE_LINE"
+elif grep -qF 'hypr.unifi_overlay' "$HYPRLAND_LUA"; then
+  info "hyprland.lua already requires the rules"
+else
+  cp "$HYPRLAND_LUA" "$HYPRLAND_LUA.bak.$(date +%s)"
+  {
+    echo ""
+    echo "-- Pinned UniFi Protect camera window rules (unifi-overlay plugin)."
+    echo "$REQUIRE_LINE"
+  } >>"$HYPRLAND_LUA"
+  info "added $REQUIRE_LINE to hyprland.lua (previous version backed up)"
+fi
+
+# --- apply ------------------------------------------------------------------
+if hyprctl reload >/dev/null 2>&1; then
+  errors="$(hyprctl configerrors 2>/dev/null | tr -d '[:space:]')"
+  if [[ -n "$errors" ]]; then
+    warn "Hyprland reported config errors:"
+    hyprctl configerrors
+    exit 1
+  fi
+  info "Hyprland reloaded cleanly"
+fi
+
+# --- register with the shell ------------------------------------------------
+if command -v omarchy-shell >/dev/null 2>&1; then
+  omarchy-shell shell rescanPlugins >/dev/null 2>&1 || true
+  info "shell rescanned"
+fi
+
+cat <<'NEXT'
+
+Done. Next:
+  1. omarchy plugin enable unifi-overlay --section right
+  2. Create an API key in UniFi OS:
+     Settings -> Control Plane -> Integrations -> Create API Key
+  3. Right-click the bar icon -> gear, enter your console address and the key.
+NEXT

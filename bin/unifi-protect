@@ -1,0 +1,1196 @@
+#!/usr/bin/env python3
+"""UniFi Protect bridge for the Omarchy shell.
+
+Talks to a UniFi Protect console over its local Integration API and owns the
+lifetime of the pinned picture-in-picture mpv window. Every subcommand prints
+a single JSON object on stdout so the QML side never has to parse prose.
+
+Stdlib only -- this runs on whatever Python the system already has.
+"""
+
+import argparse
+import errno
+import json
+import os
+import re
+import signal
+import socket
+import ssl
+import subprocess
+import sys
+import threading
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+
+SERVICE = "unifi-protect"
+KEY_LABEL = "UniFi Protect (Omarchy)"
+
+HOME = os.path.expanduser("~")
+CONFIG_PATH = os.path.join(HOME, ".config", "omarchy", "unifi-overlay.json")
+MONITOR_RULE_PATH = os.path.join(HOME, ".config", "hypr", "unifi_overlay_monitor.lua")
+
+# Presets mirror the app-id suffixes matched by hypr/unifi_overlay.lua. Changing
+# a name here means changing the window rules too.
+SIZES = ("small", "medium", "large")
+DEFAULT_SIZE = "medium"
+QUALITIES = ("high", "medium", "low", "package")
+DEFAULT_QUALITY = "high"
+MODES = ("single", "grid")
+GRID_MAX = 4
+
+DEFAULT_CONFIG = {
+    "host": "",
+    "cameraId": "",
+    "cameraName": "",
+    "quality": DEFAULT_QUALITY,
+    "size": DEFAULT_SIZE,
+    "verifyTls": False,
+    "stripSrtp": True,
+    # --- presentation
+    "monitor": "",            # "" = whichever monitor is active
+    "opacity": 1.0,
+    "noFocus": True,
+    "autoHideFullscreen": True,
+    # --- camera selection
+    "favorites": [],
+    "mode": "single",
+    "gridCameras": [],
+    # --- motion / doorbell alerts (Protect Alarm Manager webhook)
+    "alertsEnabled": False,
+    "alertPort": 8723,
+    "alertSeconds": 30,
+    "alertCameras": [],       # ids allowed to trigger; empty = any
+}
+
+
+# --------------------------------------------------------------- runtime paths
+
+def runtime_dir():
+    base = os.environ.get("XDG_RUNTIME_DIR") or os.path.join("/tmp", "omarchy-%d" % os.getuid())
+    path = os.path.join(base, "omarchy-unifi-overlay")
+    os.makedirs(path, mode=0o700, exist_ok=True)
+    return path
+
+
+def pid_path(name="pip"):
+    return os.path.join(runtime_dir(), "%s.pid" % name)
+
+
+def state_path(name="pip"):
+    return os.path.join(runtime_dir(), "%s.json" % name)
+
+
+def snapshot_path(camera_id):
+    safe = "".join(c for c in str(camera_id) if c.isalnum() or c in "-_")
+    return os.path.join(runtime_dir(), "snap-%s.jpg" % (safe or "unknown"))
+
+
+# -------------------------------------------------------------------- plumbing
+
+def emit(**payload):
+    payload.setdefault("ok", True)
+    json.dump(payload, sys.stdout)
+    sys.stdout.write("\n")
+    sys.stdout.flush()
+    return 0 if payload.get("ok") else 1
+
+
+def fail(message, **extra):
+    extra["ok"] = False
+    extra["error"] = str(message)
+    emit(**extra)
+    return 1
+
+
+def load_config():
+    config = dict(DEFAULT_CONFIG)
+    try:
+        with open(CONFIG_PATH, "r", encoding="utf-8") as handle:
+            stored = json.load(handle)
+        if isinstance(stored, dict):
+            config.update({k: v for k, v in stored.items() if k in DEFAULT_CONFIG})
+    except (OSError, ValueError):
+        pass
+    if config.get("size") not in SIZES:
+        config["size"] = DEFAULT_SIZE
+    if config.get("quality") not in QUALITIES:
+        config["quality"] = DEFAULT_QUALITY
+    if config.get("mode") not in MODES:
+        config["mode"] = "single"
+    for key in ("favorites", "gridCameras", "alertCameras"):
+        if not isinstance(config.get(key), list):
+            config[key] = []
+    try:
+        config["opacity"] = min(1.0, max(0.1, float(config.get("opacity", 1.0))))
+    except (TypeError, ValueError):
+        config["opacity"] = 1.0
+    return config
+
+
+def save_config(config):
+    os.makedirs(os.path.dirname(CONFIG_PATH), exist_ok=True)
+    tmp = CONFIG_PATH + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as handle:
+        json.dump(config, handle, indent=2, sort_keys=True)
+        handle.write("\n")
+    os.replace(tmp, CONFIG_PATH)
+
+
+# ------------------------------------------------------------------- keyring
+
+def read_key(host):
+    """Look the API key up in the login keyring, scoped to one console."""
+    if not host:
+        return ""
+    try:
+        result = subprocess.run(
+            ["secret-tool", "lookup", "service", SERVICE, "host", host],
+            capture_output=True, text=True, timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    return result.stdout.strip() if result.returncode == 0 else ""
+
+
+def write_key(host, key):
+    # The key arrives on stdin so it never lands in argv, where any user on the
+    # box could read it out of /proc.
+    proc = subprocess.run(
+        ["secret-tool", "store", "--label=%s" % KEY_LABEL,
+         "service", SERVICE, "host", host],
+        input=key + "\n", capture_output=True, text=True, timeout=15,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(proc.stderr.strip() or "secret-tool store failed")
+
+
+def clear_key(host):
+    proc = subprocess.run(
+        ["secret-tool", "clear", "service", SERVICE, "host", host],
+        capture_output=True, text=True, timeout=15,
+    )
+    # Exit 1 just means there was nothing stored; the desired state is reached.
+    if proc.returncode not in (0, 1):
+        raise RuntimeError(proc.stderr.strip() or "secret-tool clear failed")
+
+
+# ----------------------------------------------------------------- http layer
+
+class ProtectError(Exception):
+    def __init__(self, message, status=0):
+        super().__init__(message)
+        self.status = status
+
+
+def ssl_context(verify):
+    context = ssl.create_default_context()
+    if not verify:
+        # UniFi consoles ship a self-signed certificate for their LAN address,
+        # so verification is off by default and opt-in through config.
+        context.check_hostname = False
+        context.verify_mode = ssl.CERT_NONE
+    return context
+
+
+def request(config, path, method="GET", body=None, raw=False, timeout=15):
+    host = str(config.get("host") or "").strip()
+    if not host:
+        raise ProtectError("No UniFi console configured.")
+    key = read_key(host)
+    if not key:
+        raise ProtectError("No API key stored for %s." % host)
+
+    url = "https://%s/proxy/protect/integration/v1%s" % (host, path)
+    data = None
+    headers = {"X-API-KEY": key, "Accept": "application/json"}
+    if body is not None:
+        data = json.dumps(body).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+
+    req = urllib.request.Request(url, data=data, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(
+            req, timeout=timeout, context=ssl_context(config.get("verifyTls"))
+        ) as response:
+            payload = response.read()
+    except urllib.error.HTTPError as exc:
+        detail = ""
+        try:
+            detail = exc.read().decode("utf-8", "replace")[:200]
+        except Exception:
+            pass
+        if exc.code == 401:
+            raise ProtectError("API key rejected (401). Regenerate it in UniFi OS.", 401)
+        if exc.code == 403:
+            raise ProtectError("API key lacks permission for this resource (403).", 403)
+        if exc.code == 404:
+            raise ProtectError("Not found (404). %s" % detail, 404)
+        raise ProtectError("HTTP %d from console. %s" % (exc.code, detail), exc.code)
+    except urllib.error.URLError as exc:
+        raise ProtectError("Cannot reach %s: %s" % (host, exc.reason))
+    except (TimeoutError, socket.timeout):
+        raise ProtectError("Timed out talking to %s." % host)
+
+    if raw:
+        return payload
+    if not payload:
+        return {}
+    try:
+        return json.loads(payload.decode("utf-8"))
+    except ValueError:
+        raise ProtectError("Console returned a non-JSON response.")
+
+
+# ------------------------------------------------------------ protect queries
+
+def camera_summary(entry):
+    flags = entry.get("featureFlags") or {}
+    return {
+        "id": entry.get("id") or "",
+        "name": entry.get("name") or "Unnamed camera",
+        "state": entry.get("state") or "UNKNOWN",
+        "model": entry.get("type") or entry.get("modelKey") or "",
+        "connected": str(entry.get("state") or "").upper() == "CONNECTED",
+        "hasSpeaker": bool(flags.get("hasSpeaker")),
+        "isDoorbell": "doorbell" in str(entry.get("type") or "").lower(),
+    }
+
+
+def list_cameras(config):
+    payload = request(config, "/cameras")
+    entries = payload if isinstance(payload, list) else payload.get("cameras") or []
+    cameras = [camera_summary(e) for e in entries if isinstance(e, dict) and e.get("id")]
+    cameras.sort(key=lambda c: c["name"].lower())
+    return cameras
+
+
+def stream_url(config, camera_id, quality=None, enable=True):
+    """Resolve an RTSPS URL, enabling that quality on the camera if needed."""
+    quality = quality or config.get("quality") or DEFAULT_QUALITY
+    path = "/cameras/%s/rtsps-stream?qualities=%s" % (
+        urllib.parse.quote(camera_id), urllib.parse.quote(quality))
+    payload = request(config, path)
+    url = payload.get(quality) if isinstance(payload, dict) else None
+
+    if not url and enable:
+        # Protect only publishes a stream once that quality is switched on, so
+        # turn it on rather than making the user hunt through the Protect UI.
+        request(config, "/cameras/%s/rtsps-stream" % urllib.parse.quote(camera_id),
+                method="PATCH", body={"qualities": [quality]})
+        time.sleep(1.0)
+        payload = request(config, path)
+        url = payload.get(quality) if isinstance(payload, dict) else None
+
+    if not url:
+        raise ProtectError(
+            "Camera has no %s RTSPS stream. Enable RTSP for it in Protect." % quality)
+
+    if config.get("stripSrtp", True):
+        # ffmpeg speaks plain RTSP-over-TLS; the enableSrtp hint only confuses it.
+        url = url.split("?", 1)[0]
+    return url
+
+
+# ------------------------------------------------------------------- hyprland
+
+def hypr(dispatch):
+    """Run one Hyprland lua dispatcher. Returns True on success.
+
+    Hyprland 0.56 dropped the legacy `hyprctl dispatch <name> <args>` form in
+    favour of lua dispatchers, so everything goes through hl.dsp.*.
+    """
+    try:
+        result = subprocess.run(["hyprctl", "dispatch", dispatch],
+                                capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return result.returncode == 0 and "error" not in (result.stdout or "").lower()
+
+
+def pip_windows():
+    """Every live window belonging to this plugin, newest layout first."""
+    try:
+        result = subprocess.run(["hyprctl", "clients", "-j"],
+                                capture_output=True, text=True, timeout=5)
+        clients = json.loads(result.stdout or "[]")
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return []
+    return [c for c in clients
+            if re.match(r"^omarchy-unifi-(pip|grid)-", str(c.get("class") or ""))]
+
+
+def set_window_prop(address, prop, value):
+    return hypr("hl.dsp.window.set_prop{ window = '%s', prop = '%s', value = %s }"
+                % (address, prop, value))
+
+
+def apply_window_props(config):
+    """Opacity and focus behaviour, applied once the window actually exists."""
+    windows = pip_windows()
+    if not windows:
+        return False
+    opacity = float(config.get("opacity", 1.0))
+    no_focus = 1 if config.get("noFocus", True) else 0
+    for window in windows:
+        address = window.get("address")
+        if not address:
+            continue
+        set_window_prop(address, "opacity", "%.3f" % opacity)
+        set_window_prop(address, "no_focus", no_focus)
+    return True
+
+
+def set_windows_visible(visible, config):
+    """Hide without tearing the stream down.
+
+    Opacity 0 keeps mpv decoding and keeps the window's geometry, so coming back
+    from a fullscreen game is instant instead of a five-second reconnect.
+    """
+    target = ("%.3f" % float(config.get("opacity", 1.0))) if visible else "0"
+    changed = False
+    for window in pip_windows():
+        address = window.get("address")
+        if address and set_window_prop(address, "opacity", target):
+            changed = True
+    return changed
+
+
+def write_monitor_rule(monitor):
+    """Pin the view to one display by generating a rule Hyprland can read.
+
+    hl.dsp.window.move only acts on the *active* window, and this window is
+    deliberately never focused, so placement has to come from a rule.
+    """
+    name = str(monitor or "").strip()
+    body = "-- Generated by the unifi-overlay plugin. Edit the plugin setting, not this file.\n"
+    if name:
+        body += ('o.window({ class = "^omarchy-unifi-(pip|grid)-(small|medium|large)$" }, '
+                 '{ monitor = "%s" })\n' % name)
+    os.makedirs(os.path.dirname(MONITOR_RULE_PATH), exist_ok=True)
+    try:
+        with open(MONITOR_RULE_PATH, "r", encoding="utf-8") as handle:
+            if handle.read() == body:
+                return False
+    except OSError:
+        pass
+    with open(MONITOR_RULE_PATH, "w", encoding="utf-8") as handle:
+        handle.write(body)
+    subprocess.run(["hyprctl", "reload"], capture_output=True, timeout=10)
+    return True
+
+
+def monitor_names():
+    try:
+        result = subprocess.run(["hyprctl", "monitors", "-j"],
+                                capture_output=True, text=True, timeout=5)
+        return [m.get("name") for m in json.loads(result.stdout or "[]") if m.get("name")]
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return []
+
+
+# --------------------------------------------------------------- pip lifetime
+
+def process_alive(pid):
+    try:
+        os.kill(pid, 0)
+    except OSError as exc:
+        return exc.errno == errno.EPERM
+    return True
+
+
+def read_daemon_state(name="pip"):
+    try:
+        with open(pid_path(name), "r", encoding="utf-8") as handle:
+            pid = int(handle.read().strip())
+    except (OSError, ValueError):
+        return None
+    if not process_alive(pid):
+        for path in (pid_path(name), state_path(name)):
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+        return None
+    meta = {}
+    try:
+        with open(state_path(name), "r", encoding="utf-8") as handle:
+            meta = json.load(handle)
+    except (OSError, ValueError):
+        meta = {}
+    meta["pid"] = pid
+    return meta
+
+
+def stop_daemon(name="pip"):
+    state = read_daemon_state(name)
+    if not state:
+        return False
+    pid = state["pid"]
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except OSError:
+        return False
+    for _ in range(50):
+        if not process_alive(pid):
+            break
+        time.sleep(0.1)
+    else:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except OSError:
+            pass
+    for path in (pid_path(name), state_path(name)):
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+    return True
+
+
+def mpv_base_args(app_id, title):
+    return [
+        # A dedicated app-id is what lets the Hyprland rules place this window
+        # in the corner instead of mpv's generic centered float.
+        "--wayland-app-id=%s" % app_id,
+        "--title=%s" % title,
+        "--no-border", "--no-audio", "--ontop",
+        "--profile=low-latency",
+        "--force-window=immediate",
+        "--keep-open=no",
+        "--no-osc", "--osd-level=0",
+        "--cursor-autohide=100",
+        "--no-input-default-bindings",
+        "--really-quiet",
+        "--demuxer-lavf-o=rtsp_transport=tcp,tls_verify=0,timeout=5000000",
+        "--network-timeout=10",
+    ]
+
+
+def mpv_single_command(url, size, title):
+    return ["mpv", url] + mpv_base_args("omarchy-unifi-pip-%s" % size, title)
+
+
+def mpv_grid_command(urls, size, title):
+    """One mpv process compositing up to four streams.
+
+    --lavfi-complex keeps this to a single decoder process; piping four ffmpeg
+    instances into one window costs far more CPU for the same picture.
+    """
+    cells = len(urls)
+    args = ["mpv", urls[0]]
+    for extra in urls[1:]:
+        args.append("--external-file=%s" % extra)
+
+    scaled = "".join("[vid%d]scale=640:360[c%d];" % (i + 1, i) for i in range(cells))
+    if cells == 1:
+        graph = scaled + "[c0]null[vo]"
+    elif cells == 2:
+        graph = scaled + "[c0][c1]hstack[vo]"
+    elif cells == 3:
+        # Three cameras: two on top, one centred beneath, padded to keep 2x2.
+        graph = (scaled + "[c0][c1]hstack[t];"
+                 "[c2]pad=1280:360:320:0:black[b];[t][b]vstack[vo]")
+    else:
+        graph = (scaled + "[c0][c1]hstack[t];[c2][c3]hstack[b];[t][b]vstack[vo]")
+
+    args += mpv_base_args("omarchy-unifi-grid-%s" % size, title)
+    args.append("--lavfi-complex=%s" % graph)
+    return args
+
+
+def resolve_grid_urls(config):
+    ids = [i for i in (config.get("gridCameras") or []) if i][:GRID_MAX]
+    if not ids:
+        raise ProtectError("No cameras chosen for the grid yet.")
+    urls = []
+    for camera_id in ids:
+        urls.append(stream_url(config, camera_id, config.get("quality")))
+    return urls
+
+
+def fullscreen_watcher(stop_flag, config_ref):
+    """Blank the view while a fullscreen window is focused.
+
+    Hyprland's socket2 emits `fullscreen>>1` / `fullscreen>>0`; a pinned camera
+    parked over a fullscreen game is exactly when nobody wants it.
+    """
+    sig = os.environ.get("HYPRLAND_INSTANCE_SIGNATURE")
+    base = os.environ.get("XDG_RUNTIME_DIR")
+    if not sig or not base:
+        return
+    path = os.path.join(base, "hypr", sig, ".socket2.sock")
+    if not os.path.exists(path):
+        return
+
+    hidden = False
+    while not stop_flag["flag"]:
+        try:
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+                sock.settimeout(2.0)
+                sock.connect(path)
+                buffer = b""
+                while not stop_flag["flag"]:
+                    try:
+                        chunk = sock.recv(4096)
+                    except socket.timeout:
+                        continue
+                    if not chunk:
+                        break
+                    buffer += chunk
+                    while b"\n" in buffer:
+                        line, buffer = buffer.split(b"\n", 1)
+                        event = line.decode("utf-8", "replace")
+                        if not event.startswith("fullscreen>>"):
+                            continue
+                        if not config_ref["config"].get("autoHideFullscreen", True):
+                            continue
+                        want_hidden = event.strip().endswith("1")
+                        if want_hidden != hidden:
+                            hidden = want_hidden
+                            set_windows_visible(not hidden, config_ref["config"])
+        except (OSError, socket.error):
+            pass
+        if not stop_flag["flag"]:
+            time.sleep(2.0)
+
+
+def supervise(camera_id, camera_name, size, mode):
+    """Keep mpv alive across camera reboots and network blips."""
+    stopping = {"flag": False}
+    child = {"proc": None}
+    config_ref = {"config": load_config()}
+
+    def handle_term(_signum, _frame):
+        stopping["flag"] = True
+        proc = child["proc"]
+        if proc and proc.poll() is None:
+            proc.terminate()
+
+    signal.signal(signal.SIGTERM, handle_term)
+    signal.signal(signal.SIGINT, handle_term)
+
+    with open(pid_path(), "w", encoding="utf-8") as handle:
+        handle.write(str(os.getpid()))
+    with open(state_path(), "w", encoding="utf-8") as handle:
+        json.dump({"cameraId": camera_id, "cameraName": camera_name, "size": size,
+                   "mode": mode, "startedAt": time.time()}, handle)
+
+    watcher = threading.Thread(target=fullscreen_watcher,
+                               args=(stopping, config_ref), daemon=True)
+    watcher.start()
+
+    backoff = 2.0
+    try:
+        while not stopping["flag"]:
+            config = load_config()
+            config_ref["config"] = config
+            try:
+                if mode == "grid":
+                    urls = resolve_grid_urls(config)
+                    command = mpv_grid_command(urls, size, "UniFi Overlays")
+                else:
+                    url = stream_url(config, camera_id)
+                    command = mpv_single_command(url, size, "UniFi %s" % camera_name)
+            except ProtectError:
+                if stopping["flag"]:
+                    break
+                time.sleep(backoff)
+                backoff = min(backoff * 2, 30.0)
+                continue
+
+            started = time.time()
+            proc = subprocess.Popen(command, stdout=subprocess.DEVNULL,
+                                    stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL)
+            child["proc"] = proc
+
+            # Props can only be set once the window is mapped, which is a beat
+            # after mpv starts.
+            def decorate():
+                for _ in range(40):
+                    if stopping["flag"] or proc.poll() is not None:
+                        return
+                    if apply_window_props(config):
+                        return
+                    time.sleep(0.25)
+            threading.Thread(target=decorate, daemon=True).start()
+
+            proc.wait()
+            child["proc"] = None
+            if stopping["flag"]:
+                break
+            # A stream that survived a while was healthy; reset the backoff so a
+            # one-off drop reconnects immediately instead of crawling.
+            backoff = 2.0 if time.time() - started > 30 else min(backoff * 2, 30.0)
+            time.sleep(backoff)
+    finally:
+        stopping["flag"] = True
+        for path in (pid_path(), state_path()):
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+
+
+def spawn_detached(args):
+    subprocess.Popen(
+        [sys.executable, os.path.abspath(__file__)] + args,
+        start_new_session=True,
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL,
+    )
+
+
+def resolve_target(config, camera_id):
+    camera_id = camera_id or config.get("cameraId") or ""
+    if not camera_id:
+        raise ProtectError("No camera selected yet.")
+    name = config.get("cameraName") or ""
+    if camera_id != config.get("cameraId") or not name:
+        for camera in list_cameras(config):
+            if camera["id"] == camera_id:
+                name = camera["name"]
+                break
+        else:
+            raise ProtectError("Camera is no longer present on the console.")
+    return camera_id, name
+
+
+def start_pip(config, camera_id=None, size=None, mode=None):
+    """Shared by `pip start`, `pip toggle` and the alert listener."""
+    mode = mode or config.get("mode") or "single"
+    size = size if size in SIZES else config.get("size", DEFAULT_SIZE)
+    if mode == "grid":
+        resolve_grid_urls(config)          # surface a bad grid before spawning
+        name, camera_id = "Grid", ""
+    else:
+        camera_id, name = resolve_target(config, camera_id)
+        stream_url(config, camera_id, config.get("quality"))
+    if read_daemon_state():
+        stop_daemon()
+    spawn_detached(["pip", "supervise", "--camera-id", camera_id,
+                    "--camera-name", name, "--size", size, "--mode", mode])
+    for _ in range(30):
+        time.sleep(0.1)
+        if read_daemon_state():
+            break
+    return {"running": True, "cameraId": camera_id, "cameraName": name,
+            "size": size, "mode": mode}
+
+
+# ------------------------------------------------------------ alert listener
+
+def alert_listener():
+    """Local webhook endpoint for Protect's Alarm Manager.
+
+    Protect's Integration API exposes no event stream (v1 has no /subscribe,
+    and the legacy websocket rejects API keys), but Alarm Manager can POST to a
+    webhook. That keeps this to one API key instead of also storing a password.
+    """
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+
+    stopping = {"flag": False}
+    unpin_at = {"when": 0.0}
+
+    def handle_term(_signum, _frame):
+        stopping["flag"] = True
+
+    signal.signal(signal.SIGTERM, handle_term)
+    signal.signal(signal.SIGINT, handle_term)
+
+    config = load_config()
+    port = int(config.get("alertPort", 8723))
+
+    def trigger(camera_id, label):
+        config = load_config()
+        allowed = config.get("alertCameras") or []
+        if camera_id and allowed and camera_id not in allowed:
+            return False
+        target = camera_id or config.get("cameraId")
+        if not target:
+            return False
+        try:
+            start_pip(config, camera_id=target, mode="single")
+        except ProtectError:
+            return False
+        unpin_at["when"] = time.time() + max(5, int(config.get("alertSeconds", 30)))
+        with open(state_path("alerts"), "w", encoding="utf-8") as handle:
+            json.dump({"port": port, "lastEvent": label,
+                       "lastCameraId": target, "lastAt": time.time()}, handle)
+        return True
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *_args):
+            pass
+
+        def _reject(self):
+            self.send_response(403)
+            self.end_headers()
+
+        def _accept(self, fired):
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps({"ok": True, "pinned": fired}).encode())
+
+        def _handle(self):
+            # Only the console -- or this machine -- may drive this, so a stray
+            # host on the LAN can't make the desktop flash camera feeds.
+            # Localhost is allowed so you can trigger a pin from your own
+            # scripts and keybinds without opening the door any wider.
+            expected = str(load_config().get("host") or "")
+            source = self.client_address[0]
+            if expected and source != expected and source not in ("127.0.0.1", "::1"):
+                self._reject()
+                return
+            parsed = urllib.parse.urlparse(self.path)
+            params = urllib.parse.parse_qs(parsed.query)
+            camera_id = (params.get("camera") or params.get("cameraId") or [""])[0]
+            label = (params.get("event") or ["alarm"])[0]
+
+            length = int(self.headers.get("Content-Length") or 0)
+            if length:
+                try:
+                    body = json.loads(self.rfile.read(length).decode("utf-8", "replace"))
+                    if isinstance(body, dict):
+                        camera_id = camera_id or str(
+                            body.get("cameraId")
+                            or (body.get("triggers") or [{}])[0].get("device", "")
+                            or "")
+                        label = str(body.get("alarm", {}).get("name") or label)
+                except (ValueError, IndexError, AttributeError):
+                    pass
+            self._accept(trigger(camera_id, label))
+
+        def do_POST(self):
+            self._handle()
+
+        def do_GET(self):
+            self._handle()
+
+    try:
+        server = HTTPServer(("0.0.0.0", port), Handler)
+    except OSError:
+        return
+    server.timeout = 1.0
+
+    with open(pid_path("alerts"), "w", encoding="utf-8") as handle:
+        handle.write(str(os.getpid()))
+    with open(state_path("alerts"), "w", encoding="utf-8") as handle:
+        json.dump({"port": port, "startedAt": time.time()}, handle)
+
+    try:
+        while not stopping["flag"]:
+            server.handle_request()
+            if unpin_at["when"] and time.time() >= unpin_at["when"]:
+                unpin_at["when"] = 0.0
+                stop_daemon()
+    finally:
+        server.server_close()
+        for path in (pid_path("alerts"), state_path("alerts")):
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+
+
+def local_ip(host):
+    """The address this machine presents to the console -- for webhook setup."""
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+            sock.connect((host or "192.168.1.1", 80))
+            return sock.getsockname()[0]
+    except OSError:
+        return ""
+
+
+# ------------------------------------------------------------------- commands
+
+def cmd_config(args):
+    config = load_config()
+    changed = False
+    monitor_changed = False
+    for attr, key in (("host", "host"), ("camera_id", "cameraId"),
+                      ("camera_name", "cameraName"), ("quality", "quality"),
+                      ("size", "size"), ("mode", "mode"), ("monitor", "monitor")):
+        value = getattr(args, attr, None)
+        if value is not None:
+            if key == "monitor" and value != config.get("monitor"):
+                monitor_changed = True
+            config[key] = value
+            changed = True
+    for attr, key in (("opacity", "opacity"), ("alert_port", "alertPort"),
+                      ("alert_seconds", "alertSeconds")):
+        value = getattr(args, attr, None)
+        if value is not None:
+            config[key] = value
+            changed = True
+    for attr, key in (("no_focus", "noFocus"), ("autohide", "autoHideFullscreen"),
+                      ("alerts_enabled", "alertsEnabled"), ("verify_tls", "verifyTls")):
+        value = getattr(args, attr, None)
+        if value is not None:
+            config[key] = value == "true"
+            changed = True
+    if changed:
+        save_config(config)
+        if monitor_changed:
+            write_monitor_rule(config.get("monitor"))
+        # Opacity and focus are live properties; no reason to make the user
+        # re-pin to see them.
+        apply_window_props(config)
+    return emit(config=config, hasKey=bool(read_key(config.get("host"))),
+                configPath=CONFIG_PATH, monitors=monitor_names())
+
+
+def cmd_key(args):
+    config = load_config()
+    host = args.host or config.get("host") or ""
+    if not host:
+        return fail("Set the console host before storing a key.")
+    if args.action == "status":
+        return emit(host=host, hasKey=bool(read_key(host)))
+    try:
+        if args.action == "clear":
+            clear_key(host)
+            return emit(host=host, hasKey=False)
+        key = sys.stdin.read().strip()
+        if not key:
+            return fail("No API key received on stdin.")
+        write_key(host, key)
+        if config.get("host") != host:
+            config["host"] = host
+            save_config(config)
+        return emit(host=host, hasKey=True)
+    except (RuntimeError, OSError, subprocess.SubprocessError) as exc:
+        return fail(exc, host=host)
+
+
+def cmd_check(args):
+    config = load_config()
+    try:
+        info = request(config, "/meta/info", timeout=10)
+        cameras = list_cameras(config)
+    except ProtectError as exc:
+        return fail(exc, host=config.get("host"), status=getattr(exc, "status", 0))
+    return emit(host=config.get("host"),
+                version=info.get("applicationVersion") or "unknown",
+                cameraCount=len(cameras))
+
+
+def cmd_cameras(args):
+    config = load_config()
+    try:
+        cameras = list_cameras(config)
+    except ProtectError as exc:
+        return fail(exc, cameras=[], status=getattr(exc, "status", 0))
+    favorites = config.get("favorites") or []
+    for camera in cameras:
+        camera["favorite"] = camera["id"] in favorites
+        camera["inGrid"] = camera["id"] in (config.get("gridCameras") or [])
+    return emit(cameras=cameras, activeId=config.get("cameraId") or "",
+                favorites=favorites, gridCameras=config.get("gridCameras") or [])
+
+
+def cmd_snapshot(args):
+    config = load_config()
+    camera_id = args.camera_id or config.get("cameraId") or ""
+    if not camera_id:
+        return fail("No camera selected yet.")
+    path = args.out or snapshot_path(camera_id)
+    try:
+        blob = request(
+            config,
+            "/cameras/%s/snapshot?highQuality=%s" % (
+                urllib.parse.quote(camera_id), "true" if args.high else "false"),
+            raw=True, timeout=20)
+    except ProtectError as exc:
+        return fail(exc, cameraId=camera_id, status=getattr(exc, "status", 0))
+    if not blob:
+        return fail("Console returned an empty snapshot.", cameraId=camera_id)
+    tmp = path + ".tmp"
+    with open(tmp, "wb") as handle:
+        handle.write(blob)
+    os.replace(tmp, path)
+    return emit(cameraId=camera_id, path=path, bytes=len(blob), mtime=time.time())
+
+
+def cmd_stream_url(args):
+    config = load_config()
+    try:
+        camera_id, name = resolve_target(config, args.camera_id)
+        url = stream_url(config, camera_id, args.quality)
+    except ProtectError as exc:
+        return fail(exc, status=getattr(exc, "status", 0))
+    return emit(cameraId=camera_id, cameraName=name, url=url)
+
+
+def cmd_favorites(args):
+    config = load_config()
+    favorites = list(config.get("favorites") or [])
+    camera_id = args.camera_id or config.get("cameraId") or ""
+    if args.action in ("add", "remove", "toggle"):
+        if not camera_id:
+            return fail("No camera given.")
+        present = camera_id in favorites
+        if args.action == "add" or (args.action == "toggle" and not present):
+            if not present:
+                favorites.append(camera_id)
+        else:
+            favorites = [f for f in favorites if f != camera_id]
+        config["favorites"] = favorites
+        save_config(config)
+    return emit(favorites=favorites, cameraId=camera_id)
+
+
+def cmd_cycle(args):
+    """Step to the next/previous camera, favourites first."""
+    config = load_config()
+    try:
+        cameras = list_cameras(config)
+    except ProtectError as exc:
+        return fail(exc, status=getattr(exc, "status", 0))
+    favorites = config.get("favorites") or []
+    pool = [c for c in cameras if c["id"] in favorites] or cameras
+    if not pool:
+        return fail("No cameras to cycle through.")
+
+    ids = [c["id"] for c in pool]
+    try:
+        index = ids.index(config.get("cameraId") or "")
+    except ValueError:
+        index = -1
+    step = -1 if args.direction == "prev" else 1
+    target = pool[(index + step) % len(pool)]
+
+    config["cameraId"] = target["id"]
+    config["cameraName"] = target["name"]
+    save_config(config)
+
+    running = read_daemon_state()
+    if running and (running.get("mode") or "single") != "grid":
+        try:
+            start_pip(config, camera_id=target["id"], mode="single")
+        except ProtectError as exc:
+            return fail(exc, cameraId=target["id"], cameraName=target["name"])
+    return emit(cameraId=target["id"], cameraName=target["name"],
+                pinned=bool(read_daemon_state()))
+
+
+def cmd_grid(args):
+    config = load_config()
+    if args.cameras is not None:
+        ids = [i.strip() for i in args.cameras.split(",") if i.strip()][:GRID_MAX]
+        config["gridCameras"] = ids
+        save_config(config)
+    return emit(gridCameras=config.get("gridCameras") or [], max=GRID_MAX)
+
+
+def cmd_pip(args):
+    config = load_config()
+    action = args.action
+
+    if action == "supervise":
+        supervise(args.camera_id or "", args.camera_name or "camera",
+                  args.size if args.size in SIZES else DEFAULT_SIZE,
+                  args.mode if args.mode in MODES else "single")
+        return 0
+
+    if action == "status":
+        state = read_daemon_state()
+        return emit(running=bool(state), state=state or {},
+                    size=config.get("size"), mode=config.get("mode"),
+                    cameraId=config.get("cameraId") or "")
+
+    if action == "stop":
+        return emit(running=False, stopped=stop_daemon())
+
+    running = read_daemon_state()
+    if action == "toggle" and running:
+        stop_daemon()
+        return emit(running=False, stopped=True)
+
+    try:
+        result = start_pip(config, camera_id=args.camera_id,
+                           size=args.size, mode=args.mode)
+    except ProtectError as exc:
+        return fail(exc, running=bool(read_daemon_state()),
+                    status=getattr(exc, "status", 0))
+    return emit(**result)
+
+
+def cmd_open(args):
+    """Open a normal, focusable mpv window -- the 'show me properly' path."""
+    config = load_config()
+    try:
+        camera_id, name = resolve_target(config, args.camera_id)
+        url = stream_url(config, camera_id, config.get("quality"))
+    except ProtectError as exc:
+        return fail(exc, status=getattr(exc, "status", 0))
+    subprocess.Popen(
+        ["mpv", url, "--title=UniFi %s" % name, "--wayland-app-id=omarchy-unifi-window",
+         "--no-audio", "--profile=low-latency", "--force-window=immediate",
+         "--keep-open=no", "--really-quiet",
+         "--demuxer-lavf-o=rtsp_transport=tcp,tls_verify=0,timeout=5000000",
+         "--network-timeout=10"],
+        start_new_session=True,
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL,
+    )
+    return emit(cameraId=camera_id, cameraName=name)
+
+
+def cmd_alerts(args):
+    config = load_config()
+    if args.action == "run":
+        alert_listener()
+        return 0
+    if args.action == "status":
+        state = read_daemon_state("alerts")
+        return emit(running=bool(state), state=state or {},
+                    enabled=bool(config.get("alertsEnabled")),
+                    port=config.get("alertPort"),
+                    seconds=config.get("alertSeconds"),
+                    webhook="http://%s:%s/event" % (local_ip(config.get("host")),
+                                                    config.get("alertPort")))
+    if args.action == "stop":
+        config["alertsEnabled"] = False
+        save_config(config)
+        return emit(running=False, stopped=stop_daemon("alerts"))
+
+    # start
+    if read_daemon_state("alerts"):
+        stop_daemon("alerts")
+    config["alertsEnabled"] = True
+    save_config(config)
+    spawn_detached(["alerts", "run"])
+    for _ in range(60):
+        time.sleep(0.1)
+        if read_daemon_state("alerts"):
+            break
+    state = read_daemon_state("alerts")
+    return emit(running=bool(state), port=config.get("alertPort"),
+                webhook="http://%s:%s/event" % (local_ip(config.get("host")),
+                                                config.get("alertPort")))
+
+
+def cmd_window(args):
+    """Live tweaks that shouldn't need a re-pin."""
+    config = load_config()
+    if args.action == "show":
+        return emit(changed=set_windows_visible(True, config))
+    if args.action == "hide":
+        return emit(changed=set_windows_visible(False, config))
+    return emit(applied=apply_window_props(config),
+                windows=[w.get("class") for w in pip_windows()])
+
+
+def cmd_status(args):
+    config = load_config()
+    state = read_daemon_state()
+    alerts = read_daemon_state("alerts")
+    return emit(config=config,
+                hasKey=bool(read_key(config.get("host"))),
+                pipRunning=bool(state),
+                pip=state or {},
+                alertsRunning=bool(alerts),
+                monitors=monitor_names(),
+                snapshotPath=snapshot_path(config.get("cameraId") or "none"))
+
+
+# ----------------------------------------------------------------------- main
+
+def build_parser():
+    parser = argparse.ArgumentParser(prog="unifi-protect", description=__doc__)
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    p = sub.add_parser("config", help="read or update stored configuration")
+    p.add_argument("--host")
+    p.add_argument("--camera-id")
+    p.add_argument("--camera-name")
+    p.add_argument("--quality", choices=QUALITIES)
+    p.add_argument("--size", choices=SIZES)
+    p.add_argument("--mode", choices=MODES)
+    p.add_argument("--monitor", help="display name, or '' to follow the active one")
+    p.add_argument("--opacity", type=float)
+    p.add_argument("--no-focus", choices=("true", "false"))
+    p.add_argument("--autohide", choices=("true", "false"))
+    p.add_argument("--alerts-enabled", choices=("true", "false"))
+    p.add_argument("--alert-port", type=int)
+    p.add_argument("--alert-seconds", type=int)
+    p.add_argument("--verify-tls", choices=("true", "false"))
+    p.set_defaults(func=cmd_config)
+
+    p = sub.add_parser("key", help="manage the API key in the login keyring")
+    p.add_argument("action", choices=("set", "clear", "status"))
+    p.add_argument("--host")
+    p.set_defaults(func=cmd_key)
+
+    p = sub.add_parser("check", help="verify connectivity and credentials")
+    p.set_defaults(func=cmd_check)
+
+    p = sub.add_parser("cameras", help="list cameras on the console")
+    p.set_defaults(func=cmd_cameras)
+
+    p = sub.add_parser("snapshot", help="write a still to disk for previews")
+    p.add_argument("--camera-id")
+    p.add_argument("--out")
+    p.add_argument("--high", action="store_true")
+    p.set_defaults(func=cmd_snapshot)
+
+    p = sub.add_parser("stream-url", help="resolve an RTSPS URL")
+    p.add_argument("--camera-id")
+    p.add_argument("--quality", choices=QUALITIES)
+    p.set_defaults(func=cmd_stream_url)
+
+    p = sub.add_parser("favorites", help="manage the quick-cycle list")
+    p.add_argument("action", choices=("list", "add", "remove", "toggle"))
+    p.add_argument("--camera-id")
+    p.set_defaults(func=cmd_favorites)
+
+    p = sub.add_parser("cycle", help="step through favourites (or all cameras)")
+    p.add_argument("direction", choices=("next", "prev"))
+    p.set_defaults(func=cmd_cycle)
+
+    p = sub.add_parser("grid", help="choose the cameras shown in grid mode")
+    p.add_argument("--cameras", help="comma-separated camera ids (max %d)" % GRID_MAX)
+    p.set_defaults(func=cmd_grid)
+
+    p = sub.add_parser("pip", help="control the pinned corner window")
+    p.add_argument("action", choices=("start", "stop", "toggle", "status", "supervise"))
+    p.add_argument("--camera-id")
+    p.add_argument("--camera-name")
+    p.add_argument("--size", choices=SIZES)
+    p.add_argument("--mode", choices=MODES)
+    p.set_defaults(func=cmd_pip)
+
+    p = sub.add_parser("open", help="open a full, focusable live window")
+    p.add_argument("--camera-id")
+    p.set_defaults(func=cmd_open)
+
+    p = sub.add_parser("alerts", help="doorbell/motion webhook listener")
+    p.add_argument("action", choices=("start", "stop", "status", "run"))
+    p.set_defaults(func=cmd_alerts)
+
+    p = sub.add_parser("window", help="apply live window properties")
+    p.add_argument("action", choices=("apply", "show", "hide"))
+    p.set_defaults(func=cmd_window)
+
+    p = sub.add_parser("status", help="everything the shell needs in one call")
+    p.set_defaults(func=cmd_status)
+
+    return parser
+
+
+def main(argv):
+    args = build_parser().parse_args(argv)
+    try:
+        return args.func(args)
+    except ProtectError as exc:
+        return fail(exc, status=getattr(exc, "status", 0))
+    except KeyboardInterrupt:
+        return 130
+    except Exception as exc:  # noqa: BLE001 - the shell needs JSON, never a traceback
+        return fail("%s: %s" % (type(exc).__name__, exc))
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
