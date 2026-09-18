@@ -55,6 +55,10 @@ QtObject {
   property string lastError: ""
   property string actionStatus: ""
 
+  // Surfaces that are on screen bump this, so the liveness poll runs often
+  // while someone is looking and rarely when nobody is.
+  property int panelWatchers: 0
+
   property string snapshotPath: ""
   // Bumped on every successful still so Image sources change and miss the cache.
   property int snapshotStamp: 0
@@ -100,6 +104,34 @@ QtObject {
     if (statusProc.running) return
     statusProc.command = [root.bridge, "status"]
     statusProc.running = true
+  }
+
+  // Everything that needs a reachable console, run once the config actually
+  // says we have one. This used to hang off a fixed 1200ms timer, which lost
+  // the race whenever the first status call was slow -- the camera list never
+  // loaded and the bar icon stayed struck through until the panel was opened.
+  onConfiguredChanged: if (root.configured) root.onBecameConfigured()
+
+  function onBecameConfigured() {
+    root.refreshCameras()
+    root.ensureAlerts()
+  }
+
+  // `alerts ensure` is a no-op unless the config says alerts are enabled and
+  // the listener is down, so the decision stays in the bridge rather than in
+  // a race between a status read and a start.
+  function ensureAlerts() {
+    if (alertsProc.running || !root.configured) return
+    alertsProc.command = [root.bridge, "alerts", "ensure"]
+    alertsProc.running = true
+  }
+
+  // `status` is a local read, so it never notices a console that has gone
+  // away. This is the only call that does, kept to its own slow cadence.
+  function probeReachable() {
+    if (reachProc.running || !root.configured) return
+    reachProc.command = [root.bridge, "check"]
+    reachProc.running = true
   }
 
   function refreshCameras() {
@@ -310,6 +342,7 @@ QtObject {
     root.alertSeconds = Number(config.alertSeconds || 30)
     if (payload.monitors) root.monitors = payload.monitors
     if (payload.alertsRunning !== undefined) root.alertsRunning = payload.alertsRunning === true
+    if (payload.webhook) root.webhookUrl = String(payload.webhook)
     root.hasKey = payload.hasKey === true
     root.pipRunning = payload.pipRunning === true
     if (payload.snapshotPath) root.snapshotPath = String(payload.snapshotPath)
@@ -494,9 +527,19 @@ QtObject {
       waitForEnd: true
       onStreamFinished: {
         var payload = Model.parseJson(text)
-        if (!payload || payload.ok === false) return
+        if (!payload) return
+        if (payload.ok === false) {
+          // A listener that cannot bind used to fail silently, which read as
+          // a toggle that flipped itself back off for no stated reason.
+          root.alertsRunning = false
+          root.alertsEnabled = false
+          root.lastError = payload.error || "Could not start the alert listener."
+          return
+        }
         root.alertsRunning = payload.running === true
+        if (payload.enabled !== undefined) root.alertsEnabled = payload.enabled === true
         if (payload.webhook) root.webhookUrl = String(payload.webhook)
+        if (payload.seconds) root.alertSeconds = Number(payload.seconds)
       }
     }
   }
@@ -505,6 +548,23 @@ QtObject {
     if (alertsProc.running) return
     alertsProc.command = [root.bridge, "alerts", "status"]
     alertsProc.running = true
+  }
+
+  property Process reachProc: Process {
+    command: []
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        var payload = Model.parseJson(text)
+        if (!payload) return
+        if (payload.ok === false) {
+          root.reachable = false
+          return
+        }
+        root.reachable = true
+        if (payload.version) root.consoleVersion = String(payload.version)
+      }
+    }
   }
 
   // ----------------------------------------------------------------- timers
@@ -516,29 +576,30 @@ QtObject {
 
   // The pinned window can also die on its own -- mpv killed, camera gone --
   // so the icon re-syncs with reality rather than trusting the last command.
+  //
+  // Each tick is a process spawn, and the only thing it catches is mpv dying,
+  // so it runs at 5s while something is pinned or a panel is open and backs
+  // right off otherwise rather than spawning ~17k processes a day for nothing.
   property Timer pipPoll: Timer {
-    interval: 5000
+    interval: (root.pipRunning || root.panelWatchers > 0) ? 5000 : 30000
     running: true
     repeat: true
     onTriggered: if (!root.busy) root.refreshStatus()
+  }
+
+  // The only poll that touches the network, so it gets its own slow cadence.
+  property Timer reachPoll: Timer {
+    interval: 60000
+    running: true
+    repeat: true
+    onTriggered: if (!root.busy) root.probeReachable()
   }
 
   property Timer boot: Timer {
     interval: 400
     running: true
     repeat: false
-    onTriggered: {
-      root.refreshStatus()
-      bootCameras.start()
-    }
-  }
-
-  property Timer bootCameras: Timer {
-    interval: 1200
-    repeat: false
-    onTriggered: if (root.configured) {
-      root.refreshCameras()
-      root.refreshAlerts()
-    }
+    // onConfiguredChanged picks it up from here once the config lands.
+    onTriggered: root.refreshStatus()
   }
 }

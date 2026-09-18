@@ -85,16 +85,25 @@ webhook** instead. That is a deliberate trade: it needs one manual step, but it
 means the plugin never has to store your UniFi password.
 
 1. Turn on **Doorbell & motion auto-pin** in settings and copy the URL it shows
-   (`http://<this machine>:8723/event`).
+   (`http://<this machine>:8723/event?token=…`).
 2. In Protect: **Settings → Alarm Manager → Create Alarm**.
 3. Trigger on **Doorbell Ring** or a **Smart Detection**, add a **Webhook**
-   action, and paste the URL.
-4. Append `?camera=<id>` to force a specific camera; without it the alarm pins
+   action, and paste the URL — token and all.
+4. Append `&camera=<id>` to force a specific camera; without it the alarm pins
    whichever camera is currently selected. `bin/unifi-protect cameras` lists ids.
 
-The view unpins itself after `alertSeconds` (30 by default). The listener only
-accepts requests from the console's IP or from this machine, so a stray host on
-the LAN cannot make camera feeds appear on your desktop.
+The token is minted the first time you enable alerts and is what authorises the
+console; treat the URL as a secret. Requests are accepted from this machine, from
+an address the console resolves to, or with a valid token — anything else gets a
+403, so a stray host on the LAN cannot make camera feeds appear on your desktop.
+Alerts cannot be armed at all until a console is configured.
+
+Once enabled, the listener comes back on its own after a reboot or an
+`omarchy restart shell`; the shell calls `unifi-protect alerts ensure` on start-up.
+
+The view goes away after `alertSeconds` (30 by default, settable in settings). If
+you had already pinned a camera yourself when the alarm fired, that pin is put
+back rather than dropped.
 
 ## Behaviour of the pinned window
 
@@ -102,7 +111,8 @@ the LAN cannot make camera feeds appear on your desktop.
   focus.
 - **Auto-hides over fullscreen windows** so it doesn't sit on top of a game or a
   film. It blanks rather than closing, so it returns instantly instead of
-  reconnecting.
+  reconnecting. It checks at pin time as well as on each fullscreen change, and
+  a stream that reconnects mid-game stays blanked.
 - Opacity is adjustable and applies live, without re-pinning.
 - Can be locked to one display or left to follow whichever screen is active.
 
@@ -152,7 +162,7 @@ omarchy-shell unifi-overlay status        # JSON
 bind — fill in the key you want and uncomment the line.
 
 You can also drive a pin from your own scripts, since the listener trusts
-localhost:
+localhost and needs no token there:
 
 ```bash
 curl -X POST 'http://127.0.0.1:8723/event?camera=<id>'
@@ -165,6 +175,7 @@ bin/unifi-protect cameras
 bin/unifi-protect favorites add --camera-id <id>
 bin/unifi-protect pip start --mode grid --size large
 bin/unifi-protect alerts status
+bin/unifi-protect alerts ensure   # start only if enabled and not already up
 ```
 
 ## Window placement

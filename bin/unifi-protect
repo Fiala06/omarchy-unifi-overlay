@@ -10,9 +10,11 @@ Stdlib only -- this runs on whatever Python the system already has.
 
 import argparse
 import errno
+import hmac
 import json
 import os
 import re
+import secrets
 import signal
 import socket
 import ssl
@@ -62,7 +64,13 @@ DEFAULT_CONFIG = {
     "alertPort": 8723,
     "alertSeconds": 30,
     "alertCameras": [],       # ids allowed to trigger; empty = any
+    # Shared secret in the webhook URL. Generated on first start; it is what
+    # authorises a request that does not come from this machine.
+    "alertToken": "",
 }
+
+DEFAULT_ALERT_PORT = 8723
+MIN_ALERT_SECONDS = 5
 
 
 # --------------------------------------------------------------- runtime paths
@@ -126,7 +134,26 @@ def load_config():
         config["opacity"] = min(1.0, max(0.1, float(config.get("opacity", 1.0))))
     except (TypeError, ValueError):
         config["opacity"] = 1.0
+    config["alertPort"] = valid_port(config.get("alertPort"))
+    try:
+        config["alertSeconds"] = max(MIN_ALERT_SECONDS, int(config.get("alertSeconds", 30)))
+    except (TypeError, ValueError):
+        config["alertSeconds"] = 30
+    config["alertToken"] = str(config.get("alertToken") or "")
     return config
+
+
+def valid_port(value, fallback=DEFAULT_ALERT_PORT):
+    """A port the listener can actually bind, or the default.
+
+    An out-of-range port used to be storable, and the only symptom was a
+    listener that exited on bind and a toggle that flipped back.
+    """
+    try:
+        port = int(value)
+    except (TypeError, ValueError):
+        return fallback
+    return port if 1 <= port <= 65535 else fallback
 
 
 def save_config(config):
@@ -140,10 +167,20 @@ def save_config(config):
 
 # ------------------------------------------------------------------- keyring
 
+# Every request() looks the key up, so starting a four-camera grid used to mean
+# a dozen secret-tool spawns in a row. A short TTL collapses the burst without
+# letting a long-lived supervisor hold a rotated key for long.
+_KEY_CACHE = {}
+_KEY_TTL = 30.0
+
+
 def read_key(host):
     """Look the API key up in the login keyring, scoped to one console."""
     if not host:
         return ""
+    cached = _KEY_CACHE.get(host)
+    if cached and time.time() - cached[1] < _KEY_TTL:
+        return cached[0]
     try:
         result = subprocess.run(
             ["secret-tool", "lookup", "service", SERVICE, "host", host],
@@ -151,7 +188,9 @@ def read_key(host):
         )
     except (OSError, subprocess.SubprocessError):
         return ""
-    return result.stdout.strip() if result.returncode == 0 else ""
+    key = result.stdout.strip() if result.returncode == 0 else ""
+    _KEY_CACHE[host] = (key, time.time())
+    return key
 
 
 def write_key(host, key):
@@ -162,6 +201,7 @@ def write_key(host, key):
          "service", SERVICE, "host", host],
         input=key + "\n", capture_output=True, text=True, timeout=15,
     )
+    _KEY_CACHE.pop(host, None)
     if proc.returncode != 0:
         raise RuntimeError(proc.stderr.strip() or "secret-tool store failed")
 
@@ -171,6 +211,7 @@ def clear_key(host):
         ["secret-tool", "clear", "service", SERVICE, "host", host],
         capture_output=True, text=True, timeout=15,
     )
+    _KEY_CACHE.pop(host, None)
     # Exit 1 just means there was nothing stored; the desired state is reached.
     if proc.returncode not in (0, 1):
         raise RuntimeError(proc.stderr.strip() or "secret-tool clear failed")
@@ -390,6 +431,22 @@ def monitor_names():
         return []
 
 
+def fullscreen_active():
+    """Is the focused window fullscreen right now?
+
+    socket2 only reports transitions, so pinning while a game is already
+    fullscreen would otherwise drop the view on top of it and leave it there
+    until the next toggle.
+    """
+    try:
+        result = subprocess.run(["hyprctl", "activewindow", "-j"],
+                                capture_output=True, text=True, timeout=5)
+        data = json.loads(result.stdout or "{}")
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return False
+    return bool(data.get("fullscreen"))
+
+
 # --------------------------------------------------------------- pip lifetime
 
 def process_alive(pid):
@@ -400,6 +457,44 @@ def process_alive(pid):
     return True
 
 
+def process_start_time(pid):
+    """Field 22 of /proc/<pid>/stat, which pins a pid to one incarnation.
+
+    `comm` can contain spaces and brackets, so the numeric fields are read
+    from after the last ')'.
+    """
+    try:
+        with open("/proc/%d/stat" % int(pid), "rb") as handle:
+            data = handle.read()
+        fields = data[data.rindex(b")") + 2:].split()
+        return int(fields[19])
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def clear_daemon_files(name):
+    for path in (pid_path(name), state_path(name)):
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+
+
+def write_daemon_files(name, meta):
+    """Claim the pid/state pair for this process.
+
+    The start time goes in alongside the pid so a recycled pid can never be
+    mistaken for a live daemon -- `pip stop` used to be able to SIGKILL an
+    unrelated process that happened to inherit the number.
+    """
+    payload = dict(meta or {})
+    payload["startTime"] = process_start_time(os.getpid())
+    with open(state_path(name), "w", encoding="utf-8") as handle:
+        json.dump(payload, handle)
+    with open(pid_path(name), "w", encoding="utf-8") as handle:
+        handle.write(str(os.getpid()))
+
+
 def read_daemon_state(name="pip"):
     try:
         with open(pid_path(name), "r", encoding="utf-8") as handle:
@@ -407,11 +502,7 @@ def read_daemon_state(name="pip"):
     except (OSError, ValueError):
         return None
     if not process_alive(pid):
-        for path in (pid_path(name), state_path(name)):
-            try:
-                os.unlink(path)
-            except OSError:
-                pass
+        clear_daemon_files(name)
         return None
     meta = {}
     try:
@@ -419,6 +510,13 @@ def read_daemon_state(name="pip"):
             meta = json.load(handle)
     except (OSError, ValueError):
         meta = {}
+    if not isinstance(meta, dict):
+        meta = {}
+    recorded = meta.get("startTime")
+    if recorded is not None and process_start_time(pid) != int(recorded):
+        # The pid is live but belongs to something else now.
+        clear_daemon_files(name)
+        return None
     meta["pid"] = pid
     return meta
 
@@ -441,11 +539,7 @@ def stop_daemon(name="pip"):
             os.kill(pid, signal.SIGKILL)
         except OSError:
             pass
-    for path in (pid_path(name), state_path(name)):
-        try:
-            os.unlink(path)
-        except OSError:
-            pass
+    clear_daemon_files(name)
     return True
 
 
@@ -510,11 +604,14 @@ def resolve_grid_urls(config):
     return urls
 
 
-def fullscreen_watcher(stop_flag, config_ref):
+def fullscreen_watcher(stop_flag, config_ref, hidden_ref):
     """Blank the view while a fullscreen window is focused.
 
     Hyprland's socket2 emits `fullscreen>>1` / `fullscreen>>0`; a pinned camera
     parked over a fullscreen game is exactly when nobody wants it.
+
+    The hidden flag is shared with the supervisor so that a stream which
+    reconnects mid-game comes back blanked rather than popping into view.
     """
     sig = os.environ.get("HYPRLAND_INSTANCE_SIGNATURE")
     base = os.environ.get("XDG_RUNTIME_DIR")
@@ -524,7 +621,6 @@ def fullscreen_watcher(stop_flag, config_ref):
     if not os.path.exists(path):
         return
 
-    hidden = False
     while not stop_flag["flag"]:
         try:
             with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
@@ -547,9 +643,9 @@ def fullscreen_watcher(stop_flag, config_ref):
                         if not config_ref["config"].get("autoHideFullscreen", True):
                             continue
                         want_hidden = event.strip().endswith("1")
-                        if want_hidden != hidden:
-                            hidden = want_hidden
-                            set_windows_visible(not hidden, config_ref["config"])
+                        if want_hidden != hidden_ref["hidden"]:
+                            hidden_ref["hidden"] = want_hidden
+                            set_windows_visible(not want_hidden, config_ref["config"])
         except (OSError, socket.error):
             pass
         if not stop_flag["flag"]:
@@ -561,6 +657,9 @@ def supervise(camera_id, camera_name, size, mode):
     stopping = {"flag": False}
     child = {"proc": None}
     config_ref = {"config": load_config()}
+    # Shared with the watcher and with decorate(), so a restart that lands
+    # while a game is fullscreen does not put the camera back on screen.
+    hidden_ref = {"hidden": False}
 
     def handle_term(_signum, _frame):
         stopping["flag"] = True
@@ -571,14 +670,14 @@ def supervise(camera_id, camera_name, size, mode):
     signal.signal(signal.SIGTERM, handle_term)
     signal.signal(signal.SIGINT, handle_term)
 
-    with open(pid_path(), "w", encoding="utf-8") as handle:
-        handle.write(str(os.getpid()))
-    with open(state_path(), "w", encoding="utf-8") as handle:
-        json.dump({"cameraId": camera_id, "cameraName": camera_name, "size": size,
-                   "mode": mode, "startedAt": time.time()}, handle)
+    write_daemon_files("pip", {"cameraId": camera_id, "cameraName": camera_name,
+                               "size": size, "mode": mode, "startedAt": time.time()})
+
+    if config_ref["config"].get("autoHideFullscreen", True):
+        hidden_ref["hidden"] = fullscreen_active()
 
     watcher = threading.Thread(target=fullscreen_watcher,
-                               args=(stopping, config_ref), daemon=True)
+                               args=(stopping, config_ref, hidden_ref), daemon=True)
     watcher.start()
 
     backoff = 2.0
@@ -612,6 +711,10 @@ def supervise(camera_id, camera_name, size, mode):
                     if stopping["flag"] or proc.poll() is not None:
                         return
                     if apply_window_props(config):
+                        # apply_window_props restores the configured opacity,
+                        # so re-assert the blank if we are meant to be hidden.
+                        if hidden_ref["hidden"]:
+                            set_windows_visible(False, config)
                         return
                     time.sleep(0.25)
             threading.Thread(target=decorate, daemon=True).start()
@@ -626,11 +729,7 @@ def supervise(camera_id, camera_name, size, mode):
             time.sleep(backoff)
     finally:
         stopping["flag"] = True
-        for path in (pid_path(), state_path()):
-            try:
-                os.unlink(path)
-            except OSError:
-                pass
+        clear_daemon_files("pip")
 
 
 def spawn_detached(args):
@@ -680,6 +779,29 @@ def start_pip(config, camera_id=None, size=None, mode=None):
 
 # ------------------------------------------------------------ alert listener
 
+def console_ips(host, _cache={}):
+    """Addresses the console may call from, resolved and cached briefly.
+
+    The config may hold a hostname, and comparing a hostname to a peer's IP
+    rejects every genuine alarm, so resolution has to happen here.
+    """
+    host = str(host or "").strip()
+    if not host:
+        return set()
+    cached = _cache.get(host)
+    now = time.time()
+    if cached and now - cached[1] < 300:
+        return cached[0]
+    try:
+        found = {info[4][0] for info in socket.getaddrinfo(host, None)}
+    except (OSError, ValueError):
+        # Keep the last good answer rather than locking the console out
+        # because DNS blipped.
+        found = cached[0] if cached else set()
+    _cache[host] = (found, now)
+    return found
+
+
 def alert_listener():
     """Local webhook endpoint for Protect's Alarm Manager.
 
@@ -690,7 +812,9 @@ def alert_listener():
     from http.server import BaseHTTPRequestHandler, HTTPServer
 
     stopping = {"flag": False}
-    unpin_at = {"when": 0.0}
+    # `restore` remembers the pin that was already up when an alarm fired, so
+    # the timeout puts it back instead of taking it away.
+    unpin_at = {"when": 0.0, "hadPin": False, "cameraId": "", "mode": ""}
 
     def handle_term(_signum, _frame):
         stopping["flag"] = True
@@ -699,7 +823,12 @@ def alert_listener():
     signal.signal(signal.SIGINT, handle_term)
 
     config = load_config()
-    port = int(config.get("alertPort", 8723))
+    port = valid_port(config.get("alertPort"))
+
+    def note_state(**extra):
+        payload = {"port": port, "startedAt": started_at}
+        payload.update(extra)
+        write_daemon_files("alerts", payload)
 
     def trigger(camera_id, label):
         config = load_config()
@@ -709,15 +838,30 @@ def alert_listener():
         target = camera_id or config.get("cameraId")
         if not target:
             return False
+        prior = read_daemon_state("pip")
         try:
             start_pip(config, camera_id=target, mode="single")
         except ProtectError:
             return False
-        unpin_at["when"] = time.time() + max(5, int(config.get("alertSeconds", 30)))
-        with open(state_path("alerts"), "w", encoding="utf-8") as handle:
-            json.dump({"port": port, "lastEvent": label,
-                       "lastCameraId": target, "lastAt": time.time()}, handle)
+        unpin_at.update({
+            "when": time.time() + max(MIN_ALERT_SECONDS, int(config.get("alertSeconds", 30))),
+            "hadPin": bool(prior),
+            "cameraId": (prior or {}).get("cameraId") or "",
+            "mode": (prior or {}).get("mode") or "single",
+        })
+        note_state(lastEvent=label, lastCameraId=target, lastAt=time.time())
         return True
+
+    def expire():
+        """Undo the alarm pin -- restoring yours if there was one."""
+        if not unpin_at["hadPin"]:
+            stop_daemon("pip")
+            return
+        try:
+            start_pip(load_config(), camera_id=unpin_at["cameraId"] or None,
+                      mode=unpin_at["mode"] or "single")
+        except ProtectError:
+            stop_daemon("pip")
 
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *_args):
@@ -738,13 +882,22 @@ def alert_listener():
             # host on the LAN can't make the desktop flash camera feeds.
             # Localhost is allowed so you can trigger a pin from your own
             # scripts and keybinds without opening the door any wider.
-            expected = str(load_config().get("host") or "")
-            source = self.client_address[0]
-            if expected and source != expected and source not in ("127.0.0.1", "::1"):
-                self._reject()
-                return
+            config = load_config()
             parsed = urllib.parse.urlparse(self.path)
             params = urllib.parse.parse_qs(parsed.query)
+
+            source = self.client_address[0]
+            local = source in ("127.0.0.1", "::1", "::ffff:127.0.0.1")
+            token = str(config.get("alertToken") or "")
+            supplied = (params.get("token") or [""])[0]
+            # The token is the real credential; the address check stays so a
+            # URL pasted into Protect before tokens existed keeps working.
+            # An unset host no longer means "trust everyone".
+            if not (local
+                    or (token and hmac.compare_digest(supplied, token))
+                    or source in console_ips(config.get("host"))):
+                self._reject()
+                return
             camera_id = (params.get("camera") or params.get("cameraId") or [""])[0]
             label = (params.get("event") or ["alarm"])[0]
 
@@ -770,28 +923,32 @@ def alert_listener():
 
     try:
         server = HTTPServer(("0.0.0.0", port), Handler)
-    except OSError:
+    except OSError as exc:
+        # No pid file is written, so this is the only trace the caller gets.
+        # Without it, "port already in use" showed up as a toggle that
+        # silently flipped back.
+        try:
+            with open(state_path("alerts"), "w", encoding="utf-8") as handle:
+                json.dump({"port": port,
+                           "error": "Cannot listen on port %d: %s"
+                                    % (port, exc.strerror or exc)}, handle)
+        except OSError:
+            pass
         return
     server.timeout = 1.0
 
-    with open(pid_path("alerts"), "w", encoding="utf-8") as handle:
-        handle.write(str(os.getpid()))
-    with open(state_path("alerts"), "w", encoding="utf-8") as handle:
-        json.dump({"port": port, "startedAt": time.time()}, handle)
+    started_at = time.time()
+    note_state()
 
     try:
         while not stopping["flag"]:
             server.handle_request()
             if unpin_at["when"] and time.time() >= unpin_at["when"]:
                 unpin_at["when"] = 0.0
-                stop_daemon()
+                expire()
     finally:
         server.server_close()
-        for path in (pid_path("alerts"), state_path("alerts")):
-            try:
-                os.unlink(path)
-            except OSError:
-                pass
+        clear_daemon_files("alerts")
 
 
 def local_ip(host):
@@ -822,9 +979,14 @@ def cmd_config(args):
     for attr, key in (("opacity", "opacity"), ("alert_port", "alertPort"),
                       ("alert_seconds", "alertSeconds")):
         value = getattr(args, attr, None)
-        if value is not None:
-            config[key] = value
-            changed = True
+        if value is None:
+            continue
+        if key == "alertPort" and not 1 <= int(value) <= 65535:
+            return fail("Alert port must be between 1 and 65535.")
+        if key == "alertSeconds":
+            value = max(MIN_ALERT_SECONDS, int(value))
+        config[key] = value
+        changed = True
     for attr, key in (("no_focus", "noFocus"), ("autohide", "autoHideFullscreen"),
                       ("alerts_enabled", "alertsEnabled"), ("verify_tls", "verifyTls")):
         value = getattr(args, attr, None)
@@ -978,11 +1140,22 @@ def cmd_cycle(args):
 
 def cmd_grid(args):
     config = load_config()
+    dropped = []
     if args.cameras is not None:
         ids = [i.strip() for i in args.cameras.split(",") if i.strip()][:GRID_MAX]
+        # A camera removed or renamed on the console would otherwise sit in the
+        # grid until the next pin failed with a bare 404.
+        try:
+            known = {c["id"] for c in list_cameras(config)}
+        except ProtectError:
+            known = set()
+        if known:
+            dropped = [i for i in ids if i not in known]
+            ids = [i for i in ids if i in known]
         config["gridCameras"] = ids
         save_config(config)
-    return emit(gridCameras=config.get("gridCameras") or [], max=GRID_MAX)
+    return emit(gridCameras=config.get("gridCameras") or [], max=GRID_MAX,
+                dropped=dropped)
 
 
 def cmd_pip(args):
@@ -1038,38 +1211,81 @@ def cmd_open(args):
     return emit(cameraId=camera_id, cameraName=name)
 
 
+def webhook_url(config):
+    return "http://%s:%s/event?token=%s" % (
+        local_ip(config.get("host")), config.get("alertPort"),
+        urllib.parse.quote(str(config.get("alertToken") or "")))
+
+
+def alerts_snapshot(config, **extra):
+    state = read_daemon_state("alerts")
+    payload = {"running": bool(state), "state": state or {},
+               "enabled": bool(config.get("alertsEnabled")),
+               "port": config.get("alertPort"),
+               "seconds": config.get("alertSeconds"),
+               "webhook": webhook_url(config)}
+    payload.update(extra)
+    return emit(**payload)
+
+
+def start_alerts(config):
+    """Bring the listener up and report why if it refuses."""
+    if read_daemon_state("alerts"):
+        stop_daemon("alerts")
+    # A stale error file from a previous failed start would otherwise be
+    # reported as the reason this one failed.
+    try:
+        os.unlink(state_path("alerts"))
+    except OSError:
+        pass
+    if not config.get("alertToken"):
+        config["alertToken"] = secrets.token_urlsafe(18)
+    config["alertsEnabled"] = True
+    save_config(config)
+
+    spawn_detached(["alerts", "run"])
+    for _ in range(60):
+        time.sleep(0.1)
+        if read_daemon_state("alerts"):
+            break
+
+    if read_daemon_state("alerts"):
+        return alerts_snapshot(config)
+
+    detail = ""
+    try:
+        with open(state_path("alerts"), "r", encoding="utf-8") as handle:
+            detail = str((json.load(handle) or {}).get("error") or "")
+    except (OSError, ValueError):
+        pass
+    config["alertsEnabled"] = False
+    save_config(config)
+    return fail(detail or "The alert listener did not start.",
+                running=False, port=config.get("alertPort"))
+
+
 def cmd_alerts(args):
     config = load_config()
     if args.action == "run":
         alert_listener()
         return 0
     if args.action == "status":
-        state = read_daemon_state("alerts")
-        return emit(running=bool(state), state=state or {},
-                    enabled=bool(config.get("alertsEnabled")),
-                    port=config.get("alertPort"),
-                    seconds=config.get("alertSeconds"),
-                    webhook="http://%s:%s/event" % (local_ip(config.get("host")),
-                                                    config.get("alertPort")))
+        return alerts_snapshot(config)
     if args.action == "stop":
         config["alertsEnabled"] = False
         save_config(config)
-        return emit(running=False, stopped=stop_daemon("alerts"))
+        stopped = stop_daemon("alerts")
+        return alerts_snapshot(load_config(), running=False, stopped=stopped)
+    if args.action == "ensure":
+        # Idempotent boot path: the shell calls this on start-up so that
+        # `alertsEnabled` in the config actually means something after a
+        # reboot. Doing the decision here keeps QML out of a race between
+        # the status read and the start.
+        if read_daemon_state("alerts") or not config.get("alertsEnabled"):
+            return alerts_snapshot(config)
+        return start_alerts(config)
 
-    # start
-    if read_daemon_state("alerts"):
-        stop_daemon("alerts")
-    config["alertsEnabled"] = True
-    save_config(config)
-    spawn_detached(["alerts", "run"])
-    for _ in range(60):
-        time.sleep(0.1)
-        if read_daemon_state("alerts"):
-            break
-    state = read_daemon_state("alerts")
-    return emit(running=bool(state), port=config.get("alertPort"),
-                webhook="http://%s:%s/event" % (local_ip(config.get("host")),
-                                                config.get("alertPort")))
+    return start_alerts(config)
 
 
 def cmd_window(args):
@@ -1092,6 +1308,8 @@ def cmd_status(args):
                 pipRunning=bool(state),
                 pip=state or {},
                 alertsRunning=bool(alerts),
+                alertsEnabled=bool(config.get("alertsEnabled")),
+                webhook=webhook_url(config),
                 monitors=monitor_names(),
                 snapshotPath=snapshot_path(config.get("cameraId") or "none"))
 
@@ -1167,7 +1385,7 @@ def build_parser():
     p.set_defaults(func=cmd_open)
 
     p = sub.add_parser("alerts", help="doorbell/motion webhook listener")
-    p.add_argument("action", choices=("start", "stop", "status", "run"))
+    p.add_argument("action", choices=("start", "stop", "status", "run", "ensure"))
     p.set_defaults(func=cmd_alerts)
 
     p = sub.add_parser("window", help="apply live window properties")

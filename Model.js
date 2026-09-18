@@ -67,9 +67,7 @@ function sizeName(size) {
 }
 
 function heroTitle(state) {
-  if (state.activeCameraName) return state.activeCameraName
-  if (!state.configured) return "UniFi Overlay"
-  return "UniFi Overlay"
+  return state.activeCameraName || "UniFi Overlay"
 }
 
 // Turn the bridge's error into something worth reading in a 380px panel.

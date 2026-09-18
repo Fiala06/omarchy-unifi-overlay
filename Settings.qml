@@ -285,8 +285,19 @@ Item {
               Layout.fillWidth: true
               spacing: Style.space(6)
 
+              // "package" is the doorbell package-camera stream. The bridge has
+              // always accepted it, so it is offered where it can actually
+              // resolve rather than being a value the UI can neither set nor show.
               Repeater {
-                model: ["high", "medium", "low"]
+                model: {
+                  var list = ["high", "medium", "low"]
+                  var camera = root.ready ? root.service.activeCamera : null
+                  if ((camera && camera.isDoorbell)
+                      || (root.ready && root.service.quality === "package")) {
+                    list.push("package")
+                  }
+                  return list
+                }
                 Button {
                   required property var modelData
                   text: modelData.charAt(0).toUpperCase() + modelData.slice(1)
@@ -498,9 +509,40 @@ Item {
               visible: root.ready && root.service.alertsRunning
               text: "In Protect: Settings → Alarm Manager → Create Alarm. Trigger on "
                   + "Doorbell Ring or Smart Detection, add a Webhook action, and paste "
-                  + "that URL with ?camera=<id> on the end to force a specific camera. "
-                  + "The view unpins itself after " + (root.ready ? root.service.alertSeconds : 30)
-                  + " seconds."
+                  + "that URL — token and all — adding &camera=<id> to force a specific "
+                  + "camera. The token is what lets the console in; keep the URL private."
+            }
+
+            FieldLabel {
+              visible: root.ready && root.service.alertsRunning
+              text: "SHOW FOR"
+            }
+
+            RowLayout {
+              Layout.fillWidth: true
+              visible: root.ready && root.service.alertsRunning
+              spacing: Style.space(6)
+
+              Repeater {
+                model: [15, 30, 60, 120]
+                Button {
+                  required property var modelData
+                  text: modelData < 60 ? modelData + "s" : (modelData / 60) + "m"
+                  foreground: root.foreground
+                  fontFamily: root.family
+                  bordered: true
+                  selected: root.ready && root.service.alertSeconds === modelData
+                  enabled: root.ready && !root.service.busy
+                  Layout.fillWidth: true
+                  onClicked: root.service.setAlertSeconds(modelData)
+                }
+              }
+            }
+
+            Hint {
+              visible: root.ready && root.service.alertsRunning
+              text: "How long an alarm keeps the camera up. If you had already pinned "
+                  + "a view yourself, it goes back to that one afterwards."
             }
 
             Item { Layout.fillWidth: true; Layout.preferredHeight: Style.space(4) }

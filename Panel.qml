@@ -145,7 +145,19 @@ Panel {
     })
   }
 
+  // Held while this popup is on screen, so the service knows to poll quickly.
+  // Tracked as a flag rather than a bare increment so the release is exact
+  // even if the widget is torn down while open.
+  property bool watching: false
+
+  function setWatching(on) {
+    if (!ready || watching === on) return
+    svc.panelWatchers += on ? 1 : -1
+    watching = on
+  }
+
   onOpenedChanged: {
+    setWatching(opened)
     if (!opened) return
     cursorActive = false
     if (panelFlick) panelFlick.contentY = 0
@@ -158,6 +170,8 @@ Panel {
     }
     Qt.callLater(function() { keyCatcher.forceActiveFocus() })
   }
+
+  Component.onDestruction: setWatching(false)
 
   Connections {
     target: root.svc
@@ -196,7 +210,15 @@ Panel {
     function next(): string { if (root.ready) root.svc.cycleCamera("next"); return "ok" }
     function prev(): string { if (root.ready) root.svc.cycleCamera("prev"); return "ok" }
     function grid(): string { if (root.ready) root.svc.toggleMode(); return "ok" }
-    function alerts(): string { if (root.ready) root.svc.toggleAlerts(); return "ok" }
+    // Arming the listener without a console configured used to leave an
+    // unauthenticated port open on the LAN, so this needs the same guard the
+    // settings toggle has.
+    function alerts(): string {
+      if (!root.ready) return "unavailable"
+      if (!root.configured) return "not configured"
+      root.svc.toggleAlerts()
+      return "ok"
+    }
     function refresh(): string { if (root.ready) { root.svc.refreshStatus(); root.svc.refreshCameras() } return "ok" }
     function settings(): void { root.openSettings() }
     function camera(id: string): string {
@@ -307,7 +329,7 @@ Panel {
         else if (key === "r") { root.svc.refreshStatus(); root.svc.refreshCameras(); root.svc.grabSnapshot(false) }
         else if (key === "z") root.svc.cycleSize()
         else if (key === "g") root.svc.toggleMode()
-        else if (key === "a") root.svc.toggleAlerts()
+        else if (key === "a") { if (root.configured) root.svc.toggleAlerts() }
         else if (key === "f") {
           var camera = root.selectedCamera()
           if (camera) root.svc.toggleFavorite(camera.id)
@@ -576,7 +598,8 @@ Panel {
               foreground: root.ready && root.svc.alertsRunning ? root.urgent : root.foreground
               fontFamily: root.fontFamily
               bordered: true
-              onClicked: if (root.ready) root.svc.toggleAlerts()
+              enabled: root.configured
+              onClicked: if (root.ready && root.configured) root.svc.toggleAlerts()
             }
 
             PanelActionButton {
