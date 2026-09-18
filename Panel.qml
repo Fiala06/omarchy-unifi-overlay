@@ -14,11 +14,15 @@ import "Model.js" as Model
 // steps through favourites, and the service owns all of the state.
 Panel {
   id: root
-  moduleName: "unifi-overlay"
+  // The host registry keys bar entries by plugin id, so this has to be the
+  // namespaced id. The IPC target deliberately stays short: it is what people
+  // type in keybinds and scripts, and it is independent of the id.
+  moduleName: "io.github.fiala06.unifi-overlay"
   ipcTarget: "unifi-overlay"
   manageIpc: false
 
-  readonly property var svc: bar && bar.shell ? bar.shell.serviceFor("unifi-overlay") : null
+  readonly property var svc: bar && bar.shell
+    ? bar.shell.serviceFor("io.github.fiala06.unifi-overlay") : null
   readonly property bool ready: svc !== null
 
   readonly property color foreground: bar ? bar.foreground : Color.foreground
@@ -68,7 +72,8 @@ Panel {
     if (!bar || !bar.shell || typeof bar.shell.summon !== "function") return
     // Close first: the overlay takes exclusive keyboard focus.
     root.close()
-    bar.shell.summon("unifi-overlay", JSON.stringify({}))
+    // summon() resolves against the plugin id, not the IPC target.
+    bar.shell.summon(root.moduleName, JSON.stringify({}))
   }
 
   function ensureCursor() {

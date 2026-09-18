@@ -8,7 +8,7 @@ import "Model.js" as Model
 // A `service` is mounted once per session while a `bar-widget` is mounted once
 // per monitor, so the console config, the camera list, and the pinned-window
 // lifetime all live here. Surfaces reach them through
-// `bar.shell.serviceFor("unifi-overlay")`.
+// `bar.shell.serviceFor("io.github.fiala06.unifi-overlay")`.
 QtObject {
   id: root
 
@@ -17,7 +17,11 @@ QtObject {
   property var manifest: null
 
   readonly property string home: Quickshell.env("HOME")
-  readonly property string pluginDir: home + "/.config/omarchy/plugins/unifi-overlay"
+  // `omarchy plugin add` names the install directory after the manifest id,
+  // so deriving it here keeps the two from drifting apart.
+  readonly property string pluginId: (manifest && manifest.id)
+    ? String(manifest.id) : "io.github.fiala06.unifi-overlay"
+  readonly property string pluginDir: home + "/.config/omarchy/plugins/" + pluginId
   readonly property string bridge: pluginDir + "/bin/unifi-protect"
 
   // ------------------------------------------------------------------ state

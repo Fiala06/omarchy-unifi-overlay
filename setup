@@ -79,7 +79,7 @@ fi
 cat <<'NEXT'
 
 Done. Next:
-  1. omarchy plugin enable unifi-overlay --section right
+  1. omarchy plugin enable io.github.fiala06.unifi-overlay --section right
   2. Create an API key in UniFi OS:
      Settings -> Control Plane -> Integrations -> Create API Key
   3. Right-click the bar icon -> gear, enter your console address and the key.

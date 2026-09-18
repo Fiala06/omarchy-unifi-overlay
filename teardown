@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Undo everything `setup` did, and stop anything this plugin left running.
 #
-# Run this BEFORE `omarchy plugin remove unifi-overlay` -- once the plugin
+# Run this BEFORE `omarchy plugin remove io.github.fiala06.unifi-overlay` -- once the plugin
 # directory is gone, this script goes with it.
 #
 #   ./teardown            remove window rules, stop daemons, keep credentials
@@ -36,7 +36,7 @@ pkill -f 'omarchy-unifi-(pip|grid|window)' >/dev/null 2>&1 || true
 
 # --- disable in the shell ---------------------------------------------------
 if command -v omarchy >/dev/null 2>&1; then
-  omarchy plugin disable unifi-overlay >/dev/null 2>&1 || true
+  omarchy plugin disable io.github.fiala06.unifi-overlay >/dev/null 2>&1 || true
   info "disabled the plugin in the shell"
 fi
 
@@ -105,5 +105,5 @@ fi
 cat <<'NEXT'
 
 Done. Finish with:
-  omarchy plugin remove unifi-overlay
+  omarchy plugin remove io.github.fiala06.unifi-overlay
 NEXT

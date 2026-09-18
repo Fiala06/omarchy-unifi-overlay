@@ -11,8 +11,8 @@ import "Model.js" as Model
 // Console address, API key, and stream quality.
 //
 // Summoned by the shell rather than over IPC: the bar widget already owns the
-// "unifi-overlay" target, and a target routes to one handler.
-//   omarchy-shell shell summon unifi-overlay '{}'
+// "unifi-overlay" IPC target, and a target routes to one handler.
+//   omarchy-shell shell summon io.github.fiala06.unifi-overlay '{}'
 Item {
   id: root
 
@@ -51,7 +51,7 @@ Item {
   function dismiss() {
     root.opened = false
     if (root.shell && typeof root.shell.hide === "function") {
-      root.shell.hide((root.manifest && root.manifest.id) || "unifi-overlay")
+      root.shell.hide((root.manifest && root.manifest.id) || "io.github.fiala06.unifi-overlay")
     }
   }
 

@@ -18,8 +18,8 @@ doorbell rings.
 
 ```bash
 omarchy plugin add https://github.com/Fiala06/omarchy-unifi-overlay.git
-~/.config/omarchy/plugins/unifi-overlay/setup
-omarchy plugin enable unifi-overlay --section right
+~/.config/omarchy/plugins/io.github.fiala06.unifi-overlay/setup
+omarchy plugin enable io.github.fiala06.unifi-overlay --section right
 ```
 
 `setup` installs the Hyprland window rules that float, pin and place the camera
@@ -31,11 +31,30 @@ Then create an API key in UniFi OS (**Settings → Control Plane → Integration
 Create API Key**) and paste it into the plugin's settings — right-click the bar
 icon, then the gear.
 
+The scripting commands keep the short `unifi-overlay` IPC name, so keybinds do
+not have to carry the full id.
+
+### Upgrading from 1.x
+
+Versions before 2.0 used the un-namespaced id `unifi-overlay`. Omarchy names the
+install directory after the manifest id, so the rename needs one manual move:
+
+```bash
+cd ~/.config/omarchy/plugins
+mv unifi-overlay io.github.fiala06.unifi-overlay
+sed -i 's/"id": "unifi-overlay"/"id": "io.github.fiala06.unifi-overlay"/' \
+  ~/.config/omarchy/shell.json
+omarchy restart shell
+```
+
+Your console address, API key and settings are untouched — they are keyed on the
+config file and the keyring, not the plugin id.
+
 ### Uninstall
 
 ```bash
-~/.config/omarchy/plugins/unifi-overlay/teardown   # --purge also drops config + API key
-omarchy plugin remove unifi-overlay
+~/.config/omarchy/plugins/io.github.fiala06.unifi-overlay/teardown   # --purge also drops config + API key
+omarchy plugin remove io.github.fiala06.unifi-overlay
 ```
 
 Run `teardown` *before* removing the plugin, while the bridge is still there to
