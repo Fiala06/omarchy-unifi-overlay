@@ -603,7 +603,32 @@ QtObject {
     interval: 400
     running: true
     repeat: false
-    // onConfiguredChanged picks it up from here once the config lands.
-    onTriggered: root.refreshStatus()
+    // onConfiguredChanged picks up the rest once the config lands.
+    onTriggered: {
+      root.applyRules()
+      root.refreshStatus()
+    }
+  }
+
+  // The window rules live in the running compositor rather than in anyone's
+  // config file, so they are installed once per shell session. `pip start`
+  // re-applies them as well, which covers a `hyprctl reload` in between.
+  function applyRules() {
+    if (rulesProc.running) return
+    rulesProc.command = [root.bridge, "rules", "apply"]
+    rulesProc.running = true
+  }
+
+  property Process rulesProc: Process {
+    command: []
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        var payload = Model.parseJson(text)
+        if (payload && payload.ok === false) {
+          root.lastError = payload.error || "Could not install the window rules."
+        }
+      }
+    }
   }
 }

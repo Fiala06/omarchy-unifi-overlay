@@ -17,33 +17,40 @@ doorbell rings.
 ## Install
 
 ```bash
-omarchy plugin add https://github.com/Fiala06/omarchy-unifi-overlay.git
-~/.config/omarchy/plugins/io.github.fiala06.unifi-overlay/setup
-omarchy plugin enable io.github.fiala06.unifi-overlay --section right
+omarchy plugin add https://github.com/Fiala06/omarchy-unifi-overlay.git --enable
 ```
 
-`setup` installs the Hyprland window rules that float, pin and place the camera
-window, and wires them into `hyprland.lua`. It has to be a separate step because
-Omarchy's plugin installer deliberately never runs plugin code. It backs up
-anything it replaces and is safe to re-run.
+That is the whole install. Then create an API key in UniFi OS (**Settings →
+Control Plane → Integrations → Create API Key**) and paste it into the plugin's
+settings — right-click the bar icon, then the gear.
 
-Then create an API key in UniFi OS (**Settings → Control Plane → Integrations →
-Create API Key**) and paste it into the plugin's settings — right-click the bar
-icon, then the gear.
+Nothing is written to `~/.config/hypr`, and `hyprland.lua` is never touched. The
+window rules that float, pin and place the camera are installed into the running
+compositor with `hyprctl eval` when the shell starts, and re-applied before each
+pin so they survive a `hyprctl reload`. There is no setup script and nothing to
+unwire on removal.
+
+Needs `mpv`, `hyprctl` and `secret-tool` on `PATH`; the plugin says so in the
+panel rather than failing as a pin that never appears.
 
 The scripting commands keep the short `unifi-overlay` IPC name, so keybinds do
-not have to carry the full id.
+not have to carry the full plugin id.
 
 ### Upgrading from 1.x
 
-Versions before 2.0 used the un-namespaced id `unifi-overlay`. Omarchy names the
-install directory after the manifest id, so the rename needs one manual move:
+Versions before 2.0 used the un-namespaced id `unifi-overlay` and installed
+Hyprland rules as files. Neither is needed now:
 
 ```bash
 cd ~/.config/omarchy/plugins
 mv unifi-overlay io.github.fiala06.unifi-overlay
 sed -i 's/"id": "unifi-overlay"/"id": "io.github.fiala06.unifi-overlay"/' \
   ~/.config/omarchy/shell.json
+
+# the rules are applied at runtime now, so drop the old files and the require line
+rm -f ~/.config/hypr/unifi_overlay.lua ~/.config/hypr/unifi_overlay_monitor.lua
+sed -i '/hypr\.unifi_overlay/d' ~/.config/hypr/hyprland.lua
+
 omarchy restart shell
 ```
 
@@ -53,15 +60,13 @@ config file and the keyring, not the plugin id.
 ### Uninstall
 
 ```bash
-~/.config/omarchy/plugins/io.github.fiala06.unifi-overlay/teardown   # --purge also drops config + API key
 omarchy plugin remove io.github.fiala06.unifi-overlay
 ```
 
-Run `teardown` *before* removing the plugin, while the bridge is still there to
-stop its own daemons. It stops the pinned view and the alert listener (which
-otherwise keeps holding its port), removes the window rules, and unwires the
-`require` line from `hyprland.lua`, backing it up first. Your console address
-and API key are kept unless you pass `--purge`.
+The pinned view and the alert listener notice the plugin directory disappearing
+and stand themselves down, and the window rules were only ever in the running
+compositor. Your console address and API key are kept, in case you reinstall; to
+drop those too, run `./teardown --purge` before removing the plugin.
 
 ## The bar icon
 
@@ -195,15 +200,20 @@ bin/unifi-protect favorites add --camera-id <id>
 bin/unifi-protect pip start --mode grid --size large
 bin/unifi-protect alerts status
 bin/unifi-protect alerts ensure   # start only if enabled and not already up
+bin/unifi-protect rules show      # print the window rules without applying them
 ```
 
 ## Window placement
 
-Geometry lives in `~/.config/hypr/unifi_overlay.lua`, required from
-`hyprland.lua`. `bin/unifi-protect` launches mpv with a per-mode, per-size
-app-id (`omarchy-unifi-pip-medium`, `omarchy-unifi-grid-large`, …) so the rules
-target it without catching mpv's other windows. Sizes are 16:9 and scale from
-monitor height.
+The rules live in `PIP_GEOMETRY` and `window_rules()` in `bin/unifi-protect`,
+and are applied with `hyprctl eval` — Hyprland 0.56 dropped `hyprctl keyword`
+for lua configs ("keyword can't work with non-legacy parsers. Use eval."), but
+eval runs against the live config, so `hl.window_rule` works there. mpv is
+launched with a per-mode, per-size app-id (`omarchy-unifi-pip-medium`,
+`omarchy-unifi-grid-large`, …) so the rules target it without catching mpv's
+other windows. Sizes are 16:9 and scale from monitor height.
+
+`bin/unifi-protect rules show` prints the exact lua without applying it.
 
 Two things there are deliberate and worth not "fixing":
 
@@ -214,11 +224,13 @@ Two things there are deliberate and worth not "fixing":
   Hyprland re-fit the window once mpv learns the video size moves it back out of
   the corner *after* the move rule has run — which made placement erratic.
 
-A single-display lock is written to `unifi_overlay_monitor.lua` by the plugin
-when you pick a monitor; it is absent until then.
+Rules added through eval cannot be removed one at a time, so changing the
+display lock reloads Hyprland first and re-applies the set; otherwise the old
+rule would keep matching alongside its replacement and the view would stay on
+the monitor you just moved it off. Nothing else in settings changes the rules.
 
 ## Requirements
 
-- Omarchy 4 (`schemaVersion: 1` plugin API), Hyprland 0.56+
+- Omarchy 4 (`schemaVersion: 1` plugin API), Hyprland 0.56+ (needs `hyprctl eval`)
 - A UniFi console running Protect, reachable on the LAN
 - `mpv`, `python3`, and `secret-tool` (libsecret) with a running keyring

@@ -1,19 +1,18 @@
 #!/usr/bin/env bash
-# Undo everything `setup` did, and stop anything this plugin left running.
+# Optional cleanup. `omarchy plugin remove` is enough on its own -- the running
+# daemons notice the plugin directory disappearing and stand themselves down,
+# and the window rules only ever lived in the running compositor, never in a
+# config file.
 #
-# Run this BEFORE `omarchy plugin remove io.github.fiala06.unifi-overlay` -- once the plugin
-# directory is gone, this script goes with it.
+# This exists for the one thing removal cannot do: forget your credentials.
 #
-#   ./teardown            remove window rules, stop daemons, keep credentials
+#   ./teardown            stop the daemons now, keep the config and API key
 #   ./teardown --purge    also delete the config file and the stored API key
 
 set -euo pipefail
 
 PLUGIN_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-CONFIG_HOME="${XDG_CONFIG_HOME:-$HOME/.config}"
-HYPR_DIR="$CONFIG_HOME/hypr"
-HYPRLAND_LUA="$HYPR_DIR/hyprland.lua"
-CONFIG_FILE="$CONFIG_HOME/omarchy/unifi-overlay.json"
+CONFIG_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/omarchy/unifi-overlay.json"
 BRIDGE="$PLUGIN_DIR/bin/unifi-protect"
 
 PURGE=0
@@ -23,69 +22,15 @@ info() { printf '  %s\n' "$*"; }
 
 echo "unifi-overlay teardown"
 
-# --- stop anything still running -------------------------------------------
-# The pinned view and the alert listener are detached daemons; removing the
-# plugin directory would orphan them, and the listener would keep holding its
-# port. Stop them first, while the bridge still exists to do it cleanly.
 if [[ -x "$BRIDGE" ]]; then
   "$BRIDGE" pip stop >/dev/null 2>&1 || true
   "$BRIDGE" alerts stop >/dev/null 2>&1 || true
   info "stopped the pinned view and the alert listener"
 fi
-pkill -f 'omarchy-unifi-(pip|grid|window)' >/dev/null 2>&1 || true
 
-# --- disable in the shell ---------------------------------------------------
-if command -v omarchy >/dev/null 2>&1; then
-  omarchy plugin disable io.github.fiala06.unifi-overlay >/dev/null 2>&1 || true
-  info "disabled the plugin in the shell"
-fi
-
-# --- window rules -----------------------------------------------------------
-for f in "$HYPR_DIR/unifi_overlay.lua" "$HYPR_DIR/unifi_overlay_monitor.lua"; do
-  if [[ -f "$f" ]]; then
-    rm -f "$f"
-    info "removed $(basename "$f")"
-  fi
-done
-
-# --- unwire hyprland.lua ----------------------------------------------------
-if [[ -f "$HYPRLAND_LUA" ]] && grep -q 'hypr\.unifi_overlay' "$HYPRLAND_LUA"; then
-  cp "$HYPRLAND_LUA" "$HYPRLAND_LUA.bak.$(date +%s)"
-  # Drop the require plus the comment line setup added directly above it, and
-  # collapse the blank line that would otherwise be left behind.
-  python3 - "$HYPRLAND_LUA" <<'PY'
-import re, sys
-path = sys.argv[1]
-with open(path, encoding="utf-8") as handle:
-    lines = handle.readlines()
-
-keep, skipped = [], False
-for line in lines:
-    if "hypr.unifi_overlay" in line:
-        skipped = True
-        # Also drop the comment line setup wrote immediately above it.
-        while keep and keep[-1].lstrip().startswith("--") and "unifi" in keep[-1].lower():
-            keep.pop()
-        continue
-    keep.append(line)
-
-if skipped:
-    text = re.sub(r"\n{3,}", "\n\n", "".join(keep))
-    with open(path, "w", encoding="utf-8") as handle:
-        handle.write(text)
-PY
-  info "removed the require line from hyprland.lua (previous version backed up)"
-fi
-
-if command -v hyprctl >/dev/null 2>&1; then
-  hyprctl reload >/dev/null 2>&1 || true
-  info "Hyprland reloaded"
-fi
-
-# --- credentials and config -------------------------------------------------
 if ((PURGE)); then
   host="$(python3 -c "
-import json,sys
+import json
 try:
     print(json.load(open('$CONFIG_FILE')).get('host',''))
 except Exception:

@@ -15,6 +15,7 @@ import json
 import os
 import re
 import secrets
+import shutil
 import signal
 import socket
 import ssl
@@ -31,10 +32,44 @@ KEY_LABEL = "UniFi Protect (Omarchy)"
 
 HOME = os.path.expanduser("~")
 CONFIG_PATH = os.path.join(HOME, ".config", "omarchy", "unifi-overlay.json")
-MONITOR_RULE_PATH = os.path.join(HOME, ".config", "hypr", "unifi_overlay_monitor.lua")
 
-# Presets mirror the app-id suffixes matched by hypr/unifi_overlay.lua. Changing
-# a name here means changing the window rules too.
+# Window rules, applied to the running Hyprland with `hyprctl eval` rather than
+# written into anyone's config.
+#
+# Hyprland 0.56 dropped `hyprctl keyword` for lua configs ("keyword can't work
+# with non-legacy parsers. Use eval."), but eval runs against the live config,
+# so hl.window_rule works there. That is what lets this plugin install with one
+# command: nothing is written under ~/.config/hypr, hyprland.lua is never
+# edited, and there is no require line to unwire on removal. Rules do not
+# survive a `hyprctl reload`, so they are re-applied before each pin.
+#
+# `move` restates the width expression instead of using `window_w`: the rule is
+# evaluated before the window has been sized, so `window_w` reads as 0 there and
+# the view lands mid-screen. webcam-overlay.lua in the Omarchy defaults does the
+# same thing for the same reason.
+#
+# No keep_aspect_ratio on the pinned presets: they are already 16:9, and letting
+# Hyprland re-fit once mpv learns the video size moves the window back out of
+# the corner after the move rule has already run.
+PIP_GEOMETRY = {
+    # app-id suffix: (width expression, height expression)
+    "pip-small":   ("(monitor_h*4/15)", "(monitor_h*3/20)"),
+    "pip-medium":  ("(monitor_h*1/3)", "(monitor_h*3/16)"),
+    "pip-large":   ("(monitor_h*4/9)", "(monitor_h/4)"),
+    # Grid packs four feeds into one window, so every preset is a step larger
+    # than its single-camera equivalent -- a quarter of a small view is unreadable.
+    "grid-small":  ("(monitor_h*4/9)", "(monitor_h/4)"),
+    "grid-medium": ("(monitor_h*3/5)", "(monitor_h*27/80)"),
+    "grid-large":  ("(monitor_h*4/5)", "(monitor_h*9/20)"),
+}
+
+PINNED_CLASS = "^omarchy-unifi-(pip|grid)-(small|medium|large)$"
+WINDOW_CLASS = "^omarchy-unifi-window$"
+TOP_MARGIN = "(monitor_h*0.04)"
+SIDE_MARGIN = 20
+
+# Presets mirror the app-id suffixes in PIP_GEOMETRY. Changing a name in one
+# means changing it in the other.
 SIZES = ("small", "medium", "large")
 DEFAULT_SIZE = "medium"
 QUALITIES = ("high", "medium", "low", "package")
@@ -350,6 +385,108 @@ def hypr(dispatch):
     return result.returncode == 0 and "error" not in (result.stdout or "").lower()
 
 
+def lua_value(value):
+    """Render a Python value as a Lua literal for hyprctl eval."""
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (int, float)):
+        return repr(value)
+    if isinstance(value, (list, tuple)):
+        return "{ %s }" % ", ".join(lua_value(v) for v in value)
+    text = str(value).replace("\\", "\\\\").replace('"', '\\"')
+    return '"%s"' % text
+
+
+def lua_table(fields):
+    return "{ %s }" % ", ".join("%s = %s" % (k, lua_value(v)) for k, v in fields.items())
+
+
+def eval_lua(snippet):
+    """Run one lua snippet against the live Hyprland config."""
+    try:
+        result = subprocess.run(["hyprctl", "eval", snippet],
+                                capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return result.returncode == 0 and "ok" in (result.stdout or "").lower()
+
+
+def window_rules(config):
+    """Every rule this plugin needs, in the order Hyprland should see them."""
+    rules = []
+    for suffix, (width, height) in PIP_GEOMETRY.items():
+        rules.append({
+            "match": {"class": "^omarchy-unifi-%s$" % suffix},
+            "size": [width, height],
+            "move": ["(monitor_w-%s-%d)" % (width.strip("()"), SIDE_MARGIN), TOP_MARGIN],
+        })
+
+    # Shared treatment: floats above everything, follows you across workspaces,
+    # and never takes focus -- clicking it leaves your keyboard where it was.
+    #
+    # Hyprland 0.56 has no click-through rule (no_input/noinput/nofocus are not
+    # fields it knows), so no_focus is as close as the compositor gets. Opacity
+    # is applied live via hl.dsp.window.set_prop instead of here, so changing it
+    # in settings does not need the rules re-applied.
+    shared = {
+        "match": {"class": PINNED_CLASS},
+        "tag": "-default-opacity",
+        "float": True,
+        "pin": True,
+        "no_initial_focus": True,
+        "no_focus": True,
+        "no_dim": True,
+        "border_size": 0,
+        "opacity": "1 1",
+    }
+    monitor = str(config.get("monitor") or "").strip()
+    if monitor:
+        # Locking to one display is just another field on the same rule, so it
+        # needs no generated file and no config reload.
+        shared["monitor"] = monitor
+    rules.append(shared)
+
+    # The "open it properly" window is an ordinary float, centered and focusable.
+    rules.append({
+        "match": {"class": WINDOW_CLASS},
+        "tag": "-default-opacity",
+        "float": True,
+        "center": True,
+        "size": [1280, 720],
+        "keep_aspect_ratio": True,
+        "opacity": "1 1",
+    })
+    return rules
+
+
+def apply_window_rules(config=None):
+    """Install the window rules into the running compositor.
+
+    Cheap and idempotent enough to run before every pin; duplicate identical
+    rules cost nothing measurable and a `hyprctl reload` clears them.
+    """
+    config = load_config() if config is None else config
+    applied = 0
+    for rule in window_rules(config):
+        fields = dict(rule)
+        match = fields.pop("match", {})
+        body = dict(fields)
+        body["match"] = match
+        if eval_lua("hl.window_rule(%s)" % lua_table_nested(body)):
+            applied += 1
+    return applied
+
+
+def lua_table_nested(fields):
+    parts = []
+    for key, value in fields.items():
+        if isinstance(value, dict):
+            parts.append("%s = %s" % (key, lua_table(value)))
+        else:
+            parts.append("%s = %s" % (key, lua_value(value)))
+    return "{ %s }" % ", ".join(parts)
+
+
 def pip_windows():
     """Every live window belonging to this plugin, newest layout first."""
     try:
@@ -398,28 +535,23 @@ def set_windows_visible(visible, config):
     return changed
 
 
-def write_monitor_rule(monitor):
-    """Pin the view to one display by generating a rule Hyprland can read.
+def reapply_window_rules(config=None):
+    """Replace the live rule set after a field inside it has changed.
 
-    hl.dsp.window.move only acts on the *active* window, and this window is
-    deliberately never focused, so placement has to come from a rule.
+    Rules added with `hyprctl eval` cannot be removed one at a time, so a stale
+    rule keeps matching alongside its replacement -- changing the display lock
+    from DP-2 back to "follow the active screen" would otherwise leave the view
+    stuck on DP-2 forever. A reload is the only way to clear them, and it is
+    cheap next to a setting the user just changed by hand.
+
+    Only the display lock changes the rules; everything else on the pinned
+    window is a live property, so this is not on any hot path.
     """
-    name = str(monitor or "").strip()
-    body = "-- Generated by the unifi-overlay plugin. Edit the plugin setting, not this file.\n"
-    if name:
-        body += ('o.window({ class = "^omarchy-unifi-(pip|grid)-(small|medium|large)$" }, '
-                 '{ monitor = "%s" })\n' % name)
-    os.makedirs(os.path.dirname(MONITOR_RULE_PATH), exist_ok=True)
     try:
-        with open(MONITOR_RULE_PATH, "r", encoding="utf-8") as handle:
-            if handle.read() == body:
-                return False
-    except OSError:
+        subprocess.run(["hyprctl", "reload"], capture_output=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
         pass
-    with open(MONITOR_RULE_PATH, "w", encoding="utf-8") as handle:
-        handle.write(body)
-    subprocess.run(["hyprctl", "reload"], capture_output=True, timeout=10)
-    return True
+    return apply_window_rules(config)
 
 
 def monitor_names():
@@ -680,6 +812,20 @@ def supervise(camera_id, camera_name, size, mode):
                                args=(stopping, config_ref, hidden_ref), daemon=True)
     watcher.start()
 
+    def uninstall_watcher():
+        """Stand down if the plugin is removed out from under us."""
+        while not stopping["flag"]:
+            time.sleep(20.0)
+            if stopping["flag"]:
+                return
+            if plugin_uninstalled():
+                stopping["flag"] = True
+                proc = child["proc"]
+                if proc and proc.poll() is None:
+                    proc.terminate()
+                return
+    threading.Thread(target=uninstall_watcher, daemon=True).start()
+
     backoff = 2.0
     try:
         while not stopping["flag"]:
@@ -767,6 +913,9 @@ def start_pip(config, camera_id=None, size=None, mode=None):
         stream_url(config, camera_id, config.get("quality"))
     if read_daemon_state():
         stop_daemon()
+    # Re-applied here rather than only at start-up, so the view still lands in
+    # the corner after a `hyprctl reload` has cleared the live rule set.
+    apply_window_rules(config)
     spawn_detached(["pip", "supervise", "--camera-id", camera_id,
                     "--camera-name", name, "--size", size, "--mode", mode])
     for _ in range(30):
@@ -946,6 +1095,10 @@ def alert_listener():
             if unpin_at["when"] and time.time() >= unpin_at["when"]:
                 unpin_at["when"] = 0.0
                 expire()
+            # handle_request returns at least once a second, so this notices a
+            # removal quickly and releases the port instead of squatting on it.
+            if plugin_uninstalled():
+                break
     finally:
         server.server_close()
         clear_daemon_files("alerts")
@@ -996,7 +1149,7 @@ def cmd_config(args):
     if changed:
         save_config(config)
         if monitor_changed:
-            write_monitor_rule(config.get("monitor"))
+            reapply_window_rules(config)
         # Opacity and focus are live properties; no reason to make the user
         # re-pin to see them.
         apply_window_props(config)
@@ -1199,6 +1352,7 @@ def cmd_open(args):
         url = stream_url(config, camera_id, config.get("quality"))
     except ProtectError as exc:
         return fail(exc, status=getattr(exc, "status", 0))
+    apply_window_rules(config)
     subprocess.Popen(
         ["mpv", url, "--title=UniFi %s" % name, "--wayland-app-id=omarchy-unifi-window",
          "--no-audio", "--profile=low-latency", "--force-window=immediate",
@@ -1299,6 +1453,56 @@ def cmd_window(args):
                 windows=[w.get("class") for w in pip_windows()])
 
 
+BRIDGE_PATH = os.path.abspath(__file__)
+
+
+def plugin_uninstalled(_misses=[0]):
+    """True once this script's own directory has really gone.
+
+    `omarchy plugin remove` deletes the folder while the pinned view and the
+    alert listener are still running, which left mpv streaming and the
+    listener holding its port with nothing left to stop them. Several
+    consecutive misses rather than one, so a transient during `plugin update`
+    does not read as a removal.
+    """
+    if os.path.exists(BRIDGE_PATH):
+        _misses[0] = 0
+        return False
+    _misses[0] += 1
+    return _misses[0] >= 3
+
+
+REQUIRED_COMMANDS = ("mpv", "hyprctl", "secret-tool")
+
+
+def missing_dependencies():
+    """Commands the plugin needs that are not on PATH.
+
+    There is no install script to check these any more, so the shell surfaces
+    them instead -- a missing mpv should say so, not fail as a pin that never
+    appears.
+    """
+    return [c for c in REQUIRED_COMMANDS if shutil.which(c) is None]
+
+
+def cmd_rules(args):
+    """Install (or just print) the live window rules.
+
+    The shell calls `rules apply` on start-up. There is nothing to uninstall:
+    these live in the running compositor, not in anyone's config file.
+    """
+    config = load_config()
+    if args.action == "show":
+        return emit(rules=["hl.window_rule(%s)" % lua_table_nested(
+            dict(list(r.items()))) for r in window_rules(config)])
+    applied = apply_window_rules(config)
+    total = len(window_rules(config))
+    if applied != total:
+        return fail("Applied %d of %d window rules; is Hyprland running?"
+                    % (applied, total), applied=applied, total=total)
+    return emit(applied=applied, total=total)
+
+
 def cmd_status(args):
     config = load_config()
     state = read_daemon_state()
@@ -1310,6 +1514,7 @@ def cmd_status(args):
                 alertsRunning=bool(alerts),
                 alertsEnabled=bool(config.get("alertsEnabled")),
                 webhook=webhook_url(config),
+                missingDependencies=missing_dependencies(),
                 monitors=monitor_names(),
                 snapshotPath=snapshot_path(config.get("cameraId") or "none"))
 
@@ -1391,6 +1596,10 @@ def build_parser():
     p = sub.add_parser("window", help="apply live window properties")
     p.add_argument("action", choices=("apply", "show", "hide"))
     p.set_defaults(func=cmd_window)
+
+    p = sub.add_parser("rules", help="install the Hyprland window rules")
+    p.add_argument("action", choices=("apply", "show"))
+    p.set_defaults(func=cmd_rules)
 
     p = sub.add_parser("status", help="everything the shell needs in one call")
     p.set_defaults(func=cmd_status)

@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "io.github.fiala06.unifi-overlay",
   "name": "UniFi Overlay",
-  "version": "2.0.0",
+  "version": "2.1.0",
   "author": "Fiala06",
   "license": "MIT",
   "description": "Pin a live UniFi Protect camera to the corner of the screen, cycle cameras from the bar, show a four-camera grid, and pop up automatically on a doorbell ring.",
